@@ -1,0 +1,104 @@
+const express = require('express');
+const axios = require('axios');
+
+const app = express();
+app.use(express.json());
+
+// Config
+const GRAFANA_HOST = 'http://your-grafana-host'; // No trailing slash
+const GRAFANA_API_KEY = 'your_grafana_api_key';
+
+const api = axios.create({
+  baseURL: `${GRAFANA_HOST}/api`,
+  headers: {
+    Authorization: `Bearer ${GRAFANA_API_KEY}`,
+    'Content-Type': 'application/json'
+  }
+});
+
+// Get all orgs
+async function getAllOrgs() {
+  const res = await api.get('/orgs');
+  return res.data;
+}
+
+// Get all datasources for an org
+async function getDataSourcesForOrg(orgId) {
+  const res = await api.get('/datasources', {
+    headers: { 'X-Grafana-Org-Id': orgId }
+  });
+  return res.data;
+}
+
+// Update a data source
+async function updateDataSource(orgId, dsId, updatedData) {
+  await api.put(`/datasources/${dsId}`, updatedData, {
+    headers: { 'X-Grafana-Org-Id': orgId }
+  });
+}
+
+// Main logic
+async function findAndUpdateDataSources({ elk_url, elk_username, new_password }) {
+  const orgs = await getAllOrgs();
+  let updatedCount = 0;
+
+  for (const org of orgs) {
+    const orgId = org.id;
+    const datasources = await getDataSourcesForOrg(orgId);
+
+    for (const ds of datasources) {
+      const matchesUrl = ds.url === elk_url;
+      const matchesUsername = ds.basicAuthUser === elk_username;
+
+      if (matchesUrl && matchesUsername) {
+        console.log(`Match found in Org ${orgId}, DS: ${ds.name} (${ds.id})`);
+
+        const fullDS = await api.get(`/datasources/${ds.id}`, {
+          headers: { 'X-Grafana-Org-Id': orgId }
+        });
+
+        const updatedDS = {
+          ...fullDS.data,
+          basicAuth: true,
+          basicAuthUser: elk_username,
+          secureJsonData: {
+            password: new_password
+          }
+        };
+
+        await updateDataSource(orgId, ds.id, updatedDS);
+        console.log(`Updated password for DS ${ds.name} in Org ${orgId}`);
+        updatedCount++;
+      }
+    }
+  }
+
+  return updatedCount;
+}
+
+// Express route
+app.post('/update-grafana-password', async (req, res) => {
+  const { elk_url, elk_username, new_password } = req.body;
+
+  if (!elk_url || !elk_username || !new_password) {
+    return res.status(400).json({ error: 'elk_url, elk_username, and new_password are required' });
+  }
+
+  try {
+    const updatedCount = await findAndUpdateDataSources({ elk_url, elk_username, new_password });
+
+    if (updatedCount > 0) {
+      res.json({ message: `Password updated for ${updatedCount} data source(s).` });
+    } else {
+      res.status(404).json({ message: 'No matching data sources found.' });
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error', details: err.message });
+  }
+});
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
