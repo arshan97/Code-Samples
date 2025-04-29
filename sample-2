@@ -10,37 +10,14 @@
               "group_name": "Tunnel_AK-to-DCE",
               "monitors": [
                 {
-                  "monitor_name": "Tunnel_latency_AKtoDCE-R1",
                   "monitor_id": "491097000010600007",
-                  "availability": "Healthy",
-                  "response_time": 12
-                }
-              ]
-            },
-            {
-              "group_name": "Tunnel_AK-to-DCW",
-              "monitors": [
-                {
-                  "monitor_name": "Tunnel_latency_AKtoDCW-R1",
-                  "monitor_id": "491097000010600008",
-                  "availability": "Critical",
-                  "response_time": 90
-                }
-              ]
-            }
-          ]
-        },
-        {
-          "service_name": "Cloudflare",
-          "groups": [
-            {
-              "group_name": "Tunnel_CF-to-DCE",
-              "monitors": [
-                {
-                  "monitor_name": "Tunnel_latency_CFtoDCE-R1",
-                  "monitor_id": "491097000010600011",
-                  "availability": "Healthy",
-                  "response_time": 15
+                  "monitor_name": "Tunnel_latency_AKtoDCE-R1",
+                  "history": [
+                    { "timestamp": "2025-04-28T09:00:00+08:00", "availability": "Healthy", "response_time": 15 },
+                    { "timestamp": "2025-04-28T09:05:00+08:00", "availability": "Healthy", "response_time": 14 },
+                    { "timestamp": "2025-04-28T09:10:00+08:00", "availability": "Warning", "response_time": 45 },
+                    { "timestamp": "2025-04-28T09:15:00+08:00", "availability": "Critical", "response_time": 100 }
+                  ]
                 }
               ]
             }
@@ -58,10 +35,13 @@
               "group_name": "Starhub_Latency",
               "monitors": [
                 {
-                  "monitor_name": "Starhub_Latency_1",
                   "monitor_id": "491097000010610001",
-                  "availability": "Healthy",
-                  "response_time": 10
+                  "monitor_name": "Starhub_Latency_1",
+                  "history": [
+                    { "timestamp": "2025-04-28T09:00:00+08:00", "availability": "Healthy", "response_time": 8 },
+                    { "timestamp": "2025-04-28T09:05:00+08:00", "availability": "Healthy", "response_time": 10 },
+                    { "timestamp": "2025-04-28T09:10:00+08:00", "availability": "Healthy", "response_time": 9 }
+                  ]
                 }
               ]
             }
@@ -73,38 +53,28 @@
       "component_name": "CDN",
       "services": [
         {
-          "service_name": "Paylah",
-          "groups": [
-            {
-              "group_name": "P2P-SG_CDN-AK",
-              "monitors": [
-                {
-                  "monitor_name": "P2P_CDN_AK_SG_1",
-                  "monitor_id": "491097000010665073",
-                  "availability": "Healthy",
-                  "response_time": 8
-                }
-              ]
-            }
-          ]
-        },
-        {
           "service_name": "IB88",
           "groups": [
             {
               "group_name": "IB88_Others",
               "monitors": [
                 {
-                  "monitor_name": "IB88_Others_CDN",
                   "monitor_id": "491097000010638092",
-                  "availability": "Healthy",
-                  "response_time": 14
+                  "monitor_name": "IB88_Others_CDN",
+                  "history": [
+                    { "timestamp": "2025-04-28T09:00:00+08:00", "availability": "Healthy", "response_time": 12 },
+                    { "timestamp": "2025-04-28T09:05:00+08:00", "availability": "Warning", "response_time": 35 },
+                    { "timestamp": "2025-04-28T09:10:00+08:00", "availability": "Critical", "response_time": 75 }
+                  ]
                 },
                 {
-                  "monitor_name": "IB88_Others_DNS",
                   "monitor_id": "491097000010632013",
-                  "availability": "Warning",
-                  "response_time": 30
+                  "monitor_name": "IB88_Others_DNS",
+                  "history": [
+                    { "timestamp": "2025-04-28T09:00:00+08:00", "availability": "Healthy", "response_time": 9 },
+                    { "timestamp": "2025-04-28T09:05:00+08:00", "availability": "Healthy", "response_time": 8 },
+                    { "timestamp": "2025-04-28T09:10:00+08:00", "availability": "Healthy", "response_time": 7 }
+                  ]
                 }
               ]
             }
@@ -112,6 +82,5 @@
         }
       ]
     }
-  ],
-  "timestamp": "2025-04-28T10:00:00+08:00"
+  ]
 }
