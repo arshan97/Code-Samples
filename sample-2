@@ -50,37 +50,96 @@
       ]
     },
     {
-      "component_name": "CDN",
-      "services": [
+  "component_name": "CDN",
+  "services": [
+    {
+      "service_name": "Akamai",
+      "groups": [
         {
-          "service_name": "IB88",
-          "groups": [
+          "group_name": "Mobile_Banking",
+          "monitors": [
             {
-              "group_name": "IB88_Others",
-              "monitors": [
-                {
-                  "monitor_id": "491097000010638092",
-                  "monitor_name": "IB88_Others_CDN",
-                  "history": [
-                    { "timestamp": "2025-04-28T09:00:00+08:00", "availability": "Healthy", "response_time": 12 },
-                    { "timestamp": "2025-04-28T09:05:00+08:00", "availability": "Warning", "response_time": 35 },
-                    { "timestamp": "2025-04-28T09:10:00+08:00", "availability": "Critical", "response_time": 75 }
-                  ]
-                },
-                {
-                  "monitor_id": "491097000010632013",
-                  "monitor_name": "IB88_Others_DNS",
-                  "history": [
-                    { "timestamp": "2025-04-28T09:00:00+08:00", "availability": "Healthy", "response_time": 9 },
-                    { "timestamp": "2025-04-28T09:05:00+08:00", "availability": "Healthy", "response_time": 8 },
-                    { "timestamp": "2025-04-28T09:10:00+08:00", "availability": "Healthy", "response_time": 7 }
-                  ]
-                }
-              ]
+              "monitor_id": "491097000010600001",
+              "monitor_name": "AK_Mobile_Latency",
+              "availability": "Healthy",
+              "response_time": 10
+            },
+            {
+              "monitor_id": "491097000010600002",
+              "monitor_name": "AK_Mobile_Response",
+              "availability": "Healthy",
+              "response_time": 12
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "service_name": "Cloudflare",
+      "groups": [
+        {
+          "group_name": "Mobile_Banking",
+          "monitors": [
+            {
+              "monitor_id": "491097000010600004",
+              "monitor_name": "CF_Mobile_Latency",
+              "availability": "Healthy",
+              "response_time": 9
+            },
+            {
+              "monitor_id": "491097000010600005",
+              "monitor_name": "CF_Mobile_Response",
+              "availability": "Healthy",
+              "response_time": 11
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "service_name": "Active_CDN",
+      "groups": [
+        {
+          "group_name": "Mobile_Banking",
+          "monitors": [
+            {
+              "monitor_id": "491097000010600001",
+              "monitor_name": "AK_Mobile_Latency",
+              "source": "Akamai",           // Explicit source
+              "availability": "Healthy",
+              "response_time": 10
+            },
+            {
+              "monitor_id": "491097000010600005",
+              "monitor_name": "CF_Mobile_Response",
+              "source": "Cloudflare",       // Explicit source
+              "availability": "Healthy",
+              "response_time": 11
+            }
+          ]
+        },
+        {
+          "group_name": "Web_Banking",
+          "monitors": [
+            {
+              "monitor_id": "491097000010600002",
+              "monitor_name": "AK_Web_Latency",
+              "source": "Akamai",
+              "availability": "Healthy",
+              "response_time": 12
+            },
+            {
+              "monitor_id": "491097000010600006",
+              "monitor_name": "CF_Web_Latency",
+              "source": "Cloudflare",
+              "availability": "Healthy",
+              "response_time": 14
             }
           ]
         }
       ]
     }
+  ]
+}
   ]
 }
