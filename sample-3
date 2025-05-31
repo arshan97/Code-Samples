@@ -1,0 +1,229 @@
+# logger.js
+
+const winston = require('winston');
+
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.printf(({ timestamp, level, message }) => {
+      return `${timestamp} - ${level.toUpperCase()}: ${message}`;
+    })
+  ),
+  transports: [
+    new winston.transports.File({ filename: 'appcode_sync.log' }),
+    new winston.transports.Console()
+  ]
+});
+
+module.exports = logger;
+
+# config.js
+
+require('dotenv').config();
+const logger = require('./logger');
+
+function validateEnv() {
+  const required = ['CLIENT_ID', 'CLIENT_SECRET', 'PASSWORD', 'DB_CONNECTION_STRING'];
+  const missing = required.filter((key) => !process.env[key]);
+
+  if (missing.length > 0) {
+    logger.error(`Missing required environment variables: ${missing.join(', ')}`);
+    process.exit(1);
+  }
+
+  logger.info('Environment variables loaded successfully');
+}
+
+validateEnv();
+
+module.exports = {
+  clientId: process.env.CLIENT_ID,
+  clientSecret: process.env.CLIENT_SECRET,
+  password: process.env.PASSWORD,
+  dbConnection: process.env.DB_CONNECTION_STRING,
+  env: process.env.ENVIRONMENT || 'local'
+};
+
+# invensys.js
+
+// invensys.js
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+const logger = require('./logger');
+const { clientId, clientSecret, password, env } = require('./config');
+
+const AUTH_URL = 'https://essgw.vsi.sgp.dbs.com:8857/oauth2/token';
+const DATA_URL = 'https://essgw.vsi.sgp.dbs.com:8857/common/appcode/apps';
+const CACHE_FILE = path.join(__dirname, 'invensys_appcode_apps.json');
+
+async function authenticate() {
+  try {
+    logger.info('Authenticating with Invensys API...');
+
+    const params = new URLSearchParams();
+    params.append('grant_type', 'password');
+    params.append('client_id', clientId);
+    params.append('username', 'govermation');
+    params.append('scope', 'ess_common_api');
+    params.append('client_secret', clientSecret);
+    params.append('password', password);
+
+    const response = await axios.post(AUTH_URL, params, {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      httpsAgent: new (require('https').Agent)({ rejectUnauthorized: false })
+    });
+
+    logger.info('Authentication successful.');
+    return response.data.access_token;
+  } catch (error) {
+    logger.error(`Authentication failed: ${error.response?.status} - ${error.message}`);
+    return null;
+  }
+}
+
+async function fetchAppCodeData() {
+  try {
+    if (env === 'local' && fs.existsSync(CACHE_FILE)) {
+      logger.info(`Reading data from local cache: ${CACHE_FILE}`);
+      const content = fs.readFileSync(CACHE_FILE, 'utf-8');
+      return JSON.parse(content);
+    }
+
+    const token = await authenticate();
+    if (!token) return [];
+
+    logger.info('Fetching data from Invensys API...');
+    const response = await axios.get(DATA_URL, {
+      headers: { Authorization: `Bearer ${token}` },
+      httpsAgent: new (require('https').Agent)({ rejectUnauthorized: false })
+    });
+
+    const data = response.data;
+    logger.info(`Fetched ${data.length} records from API.`);
+
+    // Save to cache
+    fs.writeFileSync(CACHE_FILE, JSON.stringify(data, null, 2));
+    logger.info(`Cached data to ${CACHE_FILE}`);
+
+    return data;
+  } catch (error) {
+    logger.error(`Failed to fetch appcode data: ${error.message}`);
+    return [];
+  }
+}
+
+module.exports = {
+  fetchAppCodeData
+};
+
+# db.js
+
+// db.js
+const { Sequelize, DataTypes } = require('sequelize');
+require('dotenv').config();
+
+// Use connection string if present, otherwise use individual components
+const connectionString = process.env.DB_CONNECTION_STRING || `mysql://${process.env.DB_USER}:${process.env.DB_PASSWORD}@${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_NAME}`;
+
+const sequelize = new Sequelize(connectionString, {
+  logging: false, // disable SQL query logging
+  pool: {
+    max: 5,
+    min: 0,
+    idle: 10000,
+  }
+});
+
+// Define the model
+const AppCode = sequelize.define('AppCodeContact', {
+  appcode: {
+    type: DataTypes.STRING(50),
+    primaryKey: true,
+  },
+  owner1: DataTypes.STRING(255),
+  owner1_email: DataTypes.STRING(255),
+  owner2: DataTypes.STRING(255),
+  owner2_email: DataTypes.STRING(255),
+  sme1: DataTypes.STRING(255),
+  sme1_email: DataTypes.STRING(255),
+  sme2: DataTypes.STRING(255),
+  sme2_email: DataTypes.STRING(255),
+  last_updated: {
+    type: DataTypes.DATE,
+    defaultValue: Sequelize.NOW,
+  }
+}, {
+  tableName: 'appcode_contact',
+  timestamps: false,
+});
+
+// Sync function to ensure table exists
+async function initDb() {
+  try {
+    await sequelize.authenticate();
+    console.log('✅ Database connected');
+    await AppCode.sync(); // create table if not exists
+  } catch (err) {
+    console.error('❌ DB connection error:', err);
+    process.exit(1);
+  }
+}
+
+// Sync function to upsert appcode data
+async function syncAppcodeData(appcodeData) {
+  let updated = 0;
+  for (const [appcode, data] of Object.entries(appcodeData)) {
+    try {
+      await AppCode.upsert({
+        appcode,
+        ...data,
+        last_updated: new Date(),
+      });
+      updated++;
+    } catch (err) {
+      console.warn(`⚠️ Failed to upsert appcode ${appcode}: ${err.message}`);
+    }
+  }
+  console.log(`✅ Synced ${updated} appcode records to DB`);
+}
+
+module.exports = {
+  initDb,
+  syncAppcodeData,
+};
+
+
+# main.js
+
+// main.js
+require('dotenv').config();
+const { getAppcodeData } = require('./invensys');
+const { initDb, syncAppcodeData } = require('./db');
+
+(async () => {
+  console.log('=== AppCode Contact Sync Started ===');
+  const start = Date.now();
+
+  try {
+    // 1. Load and fetch appcode data
+    const appcodeData = await getAppcodeData();
+    if (!appcodeData || Object.keys(appcodeData).length === 0) {
+      console.error('❌ No appcode data retrieved.');
+      process.exit(1);
+    }
+
+    // 2. Connect to DB
+    await initDb();
+
+    // 3. Sync to DB
+    await syncAppcodeData(appcodeData);
+
+    const duration = ((Date.now() - start) / 1000).toFixed(2);
+    console.log(`✅ AppCode Contact Sync Completed in ${duration} seconds`);
+  } catch (err) {
+    console.error('❌ Unexpected error:', err);
+    process.exit(1);
+  }
+})();
