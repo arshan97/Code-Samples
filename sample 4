@@ -1,0 +1,215 @@
+// logger.js
+const winston = require('winston');
+const dgram = require('dgram');
+
+const ELK_HOST = process.env.ELK_HOST;
+const ELK_PORT = process.env.ELK_PORT;
+const elkEnabled = ELK_HOST && ELK_PORT;
+
+function sendToElk(level, message, cluster = 'log') {
+  if (!elkEnabled) return;
+  try {
+    const client = dgram.createSocket('udp4');
+    const log = {
+      timestamp: new Date().toISOString(),
+      level,
+      message,
+      cluster
+    };
+    const payload = Buffer.from(JSON.stringify(log));
+    client.send(payload, 0, payload.length, ELK_PORT, ELK_HOST, (err) => {
+      client.close();
+    });
+  } catch (err) {
+    console.warn('Failed to send log to ELK:', err.message);
+  }
+}
+
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.printf(({ timestamp, level, message }) => {
+      sendToElk(level, message, level === 'error' ? 'alert' : 'log');
+      return `${timestamp} - ${level.toUpperCase()}: ${message}`;
+    })
+  ),
+  transports: [
+    new winston.transports.File({ filename: 'appcode_sync.log' }),
+    new winston.transports.Console()
+  ]
+});
+
+module.exports = logger;
+
+
+// main.js
+require('dotenv').config();
+const { fetchAppCodeData } = require('./invensys');
+const { initDb, syncAppcodeData } = require('./db');
+const logger = require('./logger');
+
+(async () => {
+  logger.info('=== AppCode Contact Sync Started ===');
+  const start = Date.now();
+
+  try {
+    const appcodeData = await fetchAppCodeData();
+    if (!appcodeData || Object.keys(appcodeData).length === 0) {
+      logger.error('No appcode data retrieved.');
+      process.exit(1);
+    }
+
+    await initDb();
+    await syncAppcodeData(appcodeData);
+
+    const duration = ((Date.now() - start) / 1000).toFixed(2);
+    logger.info(`AppCode Contact Sync Completed in ${duration} seconds`);
+  } catch (err) {
+    logger.error(`Unexpected error: ${err.message}`);
+    process.exit(1);
+  }
+})();
+
+// db.js
+const { Sequelize, DataTypes } = require('sequelize');
+const logger = require('./logger');
+require('dotenv').config();
+
+const connectionString = process.env.DB_CONNECTION_STRING || `mysql://${process.env.DB_USER}:${process.env.DB_PASSWORD}@${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_NAME}`;
+
+const sequelize = new Sequelize(connectionString, {
+  logging: false,
+  pool: {
+    max: 5,
+    min: 0,
+    idle: 10000,
+  }
+});
+
+const AppCode = sequelize.define('AppCodeContact', {
+  appcode: {
+    type: DataTypes.STRING(50),
+    primaryKey: true,
+  },
+  owner1: DataTypes.STRING(255),
+  owner1_email: DataTypes.STRING(255),
+  owner2: DataTypes.STRING(255),
+  owner2_email: DataTypes.STRING(255),
+  sme1: DataTypes.STRING(255),
+  sme1_email: DataTypes.STRING(255),
+  sme2: DataTypes.STRING(255),
+  sme2_email: DataTypes.STRING(255),
+  last_updated: {
+    type: DataTypes.DATE,
+    defaultValue: Sequelize.NOW,
+  }
+}, {
+  tableName: 'appcode_contact',
+  timestamps: false,
+});
+
+async function initDb() {
+  try {
+    await sequelize.authenticate();
+    logger.info('✅ Database connected');
+    await AppCode.sync();
+  } catch (err) {
+    logger.error(`❌ DB connection error: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+async function syncAppcodeData(appcodeData) {
+  let updated = 0;
+  for (const [appcode, data] of Object.entries(appcodeData)) {
+    try {
+      await AppCode.upsert({
+        appcode,
+        ...data,
+        last_updated: new Date(),
+      });
+      updated++;
+    } catch (err) {
+      logger.error(`⚠️ Failed to upsert appcode ${appcode}: ${err.message}`);
+    }
+  }
+  logger.info(`✅ Synced ${updated} appcode records to DB`);
+}
+
+module.exports = {
+  initDb,
+  syncAppcodeData,
+};
+
+
+
+// invensys.js
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+const logger = require('./logger');
+const { clientId, clientSecret, password, env } = require('./config');
+
+const AUTH_URL = 'https://essgw.vsi.sgp.dbs.com:8857/oauth2/token';
+const DATA_URL = 'https://essgw.vsi.sgp.dbs.com:8857/common/appcode/apps';
+const CACHE_FILE = path.join(__dirname, 'invensys_appcode_apps.json');
+
+async function authenticate() {
+  try {
+    logger.info('Authenticating with Invensys API...');
+
+    const params = new URLSearchParams();
+    params.append('grant_type', 'password');
+    params.append('client_id', clientId);
+    params.append('username', 'govermation');
+    params.append('scope', 'ess_common_api');
+    params.append('client_secret', clientSecret);
+    params.append('password', password);
+
+    const response = await axios.post(AUTH_URL, params, {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      httpsAgent: new (require('https').Agent)({ rejectUnauthorized: false })
+    });
+
+    logger.info('Authentication successful.');
+    return response.data.access_token;
+  } catch (error) {
+    logger.error(`Authentication failed: ${error.response?.status} - ${error.message}`);
+    return null;
+  }
+}
+
+async function fetchAppCodeData() {
+  try {
+    if (env === 'local' && fs.existsSync(CACHE_FILE)) {
+      logger.info(`Reading data from local cache: ${CACHE_FILE}`);
+      const content = fs.readFileSync(CACHE_FILE, 'utf-8');
+      return JSON.parse(content);
+    }
+
+    const token = await authenticate();
+    if (!token) return [];
+
+    logger.info('Fetching data from Invensys API...');
+    const response = await axios.get(DATA_URL, {
+      headers: { Authorization: `Bearer ${token}` },
+      httpsAgent: new (require('https').Agent)({ rejectUnauthorized: false })
+    });
+
+    const data = response.data;
+    logger.info(`Fetched ${data.length} records from API.`);
+
+    fs.writeFileSync(CACHE_FILE, JSON.stringify(data, null, 2));
+    logger.info(`Cached data to ${CACHE_FILE}`);
+
+    return data;
+  } catch (error) {
+    logger.error(`Failed to fetch appcode data: ${error.message}`);
+    return [];
+  }
+}
+
+module.exports = {
+  fetchAppCodeData
+};
