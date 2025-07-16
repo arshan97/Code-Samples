@@ -1,44 +1,56 @@
 const axios = require("axios");
-const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const dotenv = require("dotenv");
 dotenv.config();
 
-const httpsAgent = new https.Agent({ rejectUnauthorized: false });
-
 const NCEP_URL = process.env.NCEP_URL;
 const ELK_URL = process.env.ELK_URL;
-const ELK_AUTH_HEADER = process.env.ELK_AUTH_HEADER;
+const ELK_AUTH = {
+  username: process.env.ELK_USER,
+  password: process.env.ELK_PASS,
+};
 
-const tagMapPath = path.join(__dirname, "device_tag.json");
-const tagMap = JSON.parse(fs.readFileSync(tagMapPath, "utf-8"));
+const deviceTagPath = path.join(__dirname, "../data/device_tag.json");
+const outputPath = path.join(__dirname, "../data/data.json");
 
 async function fetchAndProcess() {
   try {
-    const ncepBody = {}; // Your actual request body if needed
+    // Step 1: Fetch NCEP data
+    const ncepBody = {
+      keys: "dailyDeviceListToken",
+      attributes: ["hostname", "hwType", "model", "organisation", "status"],
+    };
+
     const ncepResponse = await axios.post(NCEP_URL, ncepBody, {
       headers: { "Content-Type": "application/json" },
-      httpsAgent,
     });
 
     const deviceList = ncepResponse.data;
     console.log(`Fetched ${deviceList.length} devices from NCEP`);
 
-    const data = {};
+    // Step 2: Load tag mappings
+    const tagMap = JSON.parse(fs.readFileSync(deviceTagPath, "utf8"));
+
+    const result = {};
+    const processed = [];
 
     for (const device of deviceList) {
       const { hostname, hwType } = device;
-      let idr_result = "0";
+      if (!hostname || !hwType) continue;
+
+      let idr_result = "0"; // default
       let complianceStatus = "Unknown";
       let lastSeen = null;
       let ageInDays = null;
 
+      // Step 3: Query ELK with hostname
       const elkBody = {
+        size: 1,
         query: {
           bool: {
             must: [
-              { match: { hostname } },
+              { match: { hostname: hostname } },
               {
                 range: {
                   "@timestamp": {
@@ -50,46 +62,39 @@ async function fetchAndProcess() {
             ],
           },
         },
-        size: 1,
+        _source: ["hostname", "tags", "hw_type", "@timestamp"],
         sort: [{ "@timestamp": { order: "desc" } }],
       };
 
       try {
         const elkResponse = await axios.post(ELK_URL, elkBody, {
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: ELK_AUTH_HEADER,
-          },
-          httpsAgent,
+          auth: ELK_AUTH,
+          headers: { "Content-Type": "application/json" },
         });
 
-        const hit = elkResponse?.data?.hits?.hits?.[0];
-
-        if (!hit) {
-          idr_result = "0";
-
-          data[hostname] = {
-            idr_result,
-            complianceStatus,
-            lastSeen,
-            ageInDays,
-          };
+        const hits = elkResponse?.data?.hits?.hits;
+        if (!hits || hits.length === 0) {
+          idr_result = "0"; // no hits
         } else {
-          const elkHost = hit._source || {};
+          const elkHost = hits[0]?._source || {};
+          const elkType = elkHost.hw_type;
           const elkTag = elkHost.tags?.[0];
           lastSeen = elkHost["@timestamp"];
+
+          // Step 4: Match with tag map
           const mappedTag = tagMap[hwType];
 
           if (mappedTag === "NA") {
-            idr_result = "99";
+            idr_result = "99"; // not applicable
           } else if (!mappedTag) {
-            idr_result = "0";
+            idr_result = "0"; // unknown hwType
           } else if (elkTag === mappedTag) {
-            idr_result = "1";
+            idr_result = "1"; // match
           } else {
-            idr_result = "-1";
+            idr_result = "-1"; // wrong tag
           }
 
+          // Step 5: Compliance logic
           if (lastSeen) {
             const timeDiff = Date.now() - new Date(lastSeen).getTime();
             ageInDays = Math.floor(timeDiff / (1000 * 60 * 60 * 24));
@@ -102,31 +107,31 @@ async function fetchAndProcess() {
               complianceStatus = "Non Compliance (>2 weeks)";
             }
           }
-
-          data[hostname] = {
-            idr_result,
-            complianceStatus,
-            lastSeen,
-            ageInDays,
-          };
         }
-      } catch (error) {
-        console.error(`ELK error for ${hostname}:`, error.response?.data || error.message);
-        data[hostname] = {
-          idr_result: "0",
-          complianceStatus,
-          lastSeen,
-          ageInDays,
-        };
+      } catch (err) {
+        console.error(`ELK error for ${hostname}:`, err.message);
       }
+
+      result[hostname] = {
+        idr_result,
+        complianceStatus,
+        lastSeen,
+        ageInDays,
+      };
+      processed.push(device);
     }
 
-    const dataPath = path.join(__dirname, "data.json");
-    fs.writeFileSync(dataPath, JSON.stringify(data, null, 2));
-    console.log(`Results saved to ${dataPath}`);
+    const output = {
+      date: new Date().toISOString().slice(0, 10),
+      data: processed,
+      result,
+    };
+
+    fs.writeFileSync(outputPath, JSON.stringify(output, null, 2));
+    console.log(`✅ Wrote ${processed.length} records to data.json`);
   } catch (err) {
     console.error("Error in fetchAndProcess:", err.message);
   }
 }
 
-fetchAndProcess();
+module.exports = fetchAndProcess;
