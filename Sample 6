@@ -1,0 +1,29 @@
+const express = require("express");
+const path = require("path");
+const cron = require("node-cron");
+const dotenv = require("dotenv");
+dotenv.config();
+
+const fetchAndProcess = require("./cron/fetchData");
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Serve the data.json
+app.get("/api/data", (req, res) => {
+  const filePath = path.join(__dirname, "data/data.json");
+  res.sendFile(filePath);
+});
+
+// Schedule: every day at 1:00 AM
+cron.schedule("0 1 * * *", async () => {
+  console.log("⏳ Running scheduled data fetch...");
+  await fetchAndProcess();
+});
+
+// Optionally run immediately at startup
+fetchAndProcess();
+
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
