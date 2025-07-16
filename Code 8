@@ -1,0 +1,140 @@
+const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+const https = require("https");
+const dotenv = require("dotenv");
+dotenv.config();
+
+const NCEP_URL = process.env.NCEP_URL;
+const ELK_URL = process.env.ELK_URL;
+const ELK_AUTH = {
+  username: process.env.ELK_USER,
+  password: process.env.ELK_PASS,
+};
+
+const agent = new https.Agent({ rejectUnauthorized: false });
+
+const deviceTagPath = path.join(__dirname, "../data/device_tag.json");
+const outputPath = path.join(__dirname, "../data/data.json");
+
+const country_map = {
+  SG_DC: "SG",
+  SG_NONDC: "SG",
+  CN_NW: "CN",
+  HK_NW: "HK",
+  TW_NW: "TW",
+  ID_NW: "ID",
+  IN_NW: "IN",
+  CNSV: "CN",
+  DBSVTH_NW: "TH",
+};
+
+function calculateAge(timestamp) {
+  const now = new Date();
+  const event = new Date(timestamp);
+  const diffMs = now - event;
+  return Math.floor(diffMs / (1000 * 60 * 60 * 24)); // days
+}
+
+function categorize(age) {
+  if (age <= 7) return "Comply";
+  if (age <= 14) return "Non Compliance (<2 weeks)";
+  return "Non Compliance (>2 weeks)";
+}
+
+async function fetchAndProcess() {
+  try {
+    const ncepBody = {
+      keys: "dailyDeviceListToken",
+      attributes: ["hostname", "hwType", "model", "organisation", "status"],
+    };
+
+    const ncepResponse = await axios.post(NCEP_URL, ncepBody, {
+      headers: { "Content-Type": "application/json" },
+    });
+
+    const deviceList = ncepResponse.data;
+    console.log(`Fetched ${deviceList.length} devices from NCEP`);
+
+    const tagMap = JSON.parse(fs.readFileSync(deviceTagPath, "utf8"));
+
+    const result = {};
+    const details = {};
+
+    for (const device of deviceList) {
+      const { hostname, hwType, model, tower, organisation } = device;
+      if (!hostname || !hwType) continue;
+
+      const elkBody = {
+        size: 1,
+        query: {
+          bool: {
+            must: [{ match: { hostname: hostname } }],
+            filter: {
+              range: {
+                "@timestamp": {
+                  gte: "now-30d/d",
+                  lte: "now/d",
+                },
+              },
+            },
+          },
+        },
+        _source: ["hostname", "tags", "hw_type", "@timestamp"],
+      };
+
+      try {
+        const elkResponse = await axios.post(ELK_URL, elkBody, {
+          auth: ELK_AUTH,
+          headers: { "Content-Type": "application/json" },
+          httpsAgent: agent,
+        });
+
+        const hits = elkResponse?.data?.hits?.hits;
+        if (!hits || hits.length === 0) continue;
+
+        const src = hits[0]._source;
+        const age = calculateAge(src["@timestamp"]);
+        const category = categorize(age);
+
+        const mappedTag = tagMap[hwType] || "NA";
+        const orgCode = country_map[organisation] || "OTH";
+        const summaryKey = `data_${orgCode.toLowerCase()}`;
+        const detailKey = `detail_${orgCode.toLowerCase()}`;
+
+        // Initialize buckets
+        result[summaryKey] = result[summaryKey] || [];
+        details[detailKey] = details[detailKey] || [];
+
+        // Add to summary (aggregated by tower + category)
+        let summary = result[summaryKey].find(
+          (r) => r.tower === tower && r.category === category
+        );
+        if (summary) {
+          summary.data += 1;
+        } else {
+          result[summaryKey].push({ tower, category, data: 1 });
+        }
+
+        // Add to details
+        details[detailKey].push({
+          hostname,
+          tower,
+          hw_model: model,
+          age,
+          "Last-detection-date": src["@timestamp"].slice(0, 10),
+        });
+      } catch (err) {
+        console.error(`ELK error for ${hostname}:`, err.message);
+      }
+    }
+
+    const output = { ...result, ...details };
+    fs.writeFileSync(outputPath, JSON.stringify(output, null, 2));
+    console.log(`✅ Wrote processed data to data.json`);
+  } catch (err) {
+    console.error("Error in fetchAndProcess:", err.message);
+  }
+}
+
+module.exports = fetchAndProcess;
