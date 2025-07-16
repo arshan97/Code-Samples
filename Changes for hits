@@ -1,0 +1,71 @@
+try {
+  const elkResponse = await axios.post(ELK_URL, elkBody, {
+    auth: ELK_AUTH,
+    headers: { "Content-Type": "application/json" },
+    httpsAgent: agent,
+  });
+
+  const hits = elkResponse?.data?.hits?.hits;
+  const src = hits && hits.length > 0 ? hits[0]._source : null;
+
+  const elkTags = src?.tags || [];
+  const timestamp = src?.["@timestamp"] || null;
+  const expectedTag = tagMap[hwType];
+  const tagMatch = expectedTag && elkTags.includes(expectedTag);
+
+  let age = timestamp ? calculateAge(timestamp) : null;
+  let category = tagMatch
+    ? categorize(age)
+    : "Non Compliance (>2 weeks)"; // if tag mismatch or no timestamp
+
+  const orgCode = country_map[organisation] || "OTH";
+  const summaryKey = `data_${orgCode.toLowerCase()}`;
+  const detailKey = `detail_${orgCode.toLowerCase()}`;
+
+  result[summaryKey] = result[summaryKey] || [];
+  details[detailKey] = details[detailKey] || [];
+
+  // Add to summary
+  let summary = result[summaryKey].find(
+    (r) => r.tower === tower && r.category === category
+  );
+  if (summary) {
+    summary.data += 1;
+  } else {
+    result[summaryKey].push({ tower, category, data: 1 });
+  }
+
+  // Add to details
+  details[detailKey].push({
+    ...device,
+    age: age ?? "N/A",
+    last_detection_date: timestamp ? timestamp.slice(0, 10) : "N/A",
+  });
+} catch (err) {
+  console.error(`ELK error for ${hostname}:`, err.message);
+
+  // In case of ELK error, still include device as Non Compliance (>2 weeks)
+  const orgCode = country_map[organisation] || "OTH";
+  const summaryKey = `data_${orgCode.toLowerCase()}`;
+  const detailKey = `detail_${orgCode.toLowerCase()}`;
+
+  result[summaryKey] = result[summaryKey] || [];
+  details[detailKey] = details[detailKey] || [];
+
+  // Add to summary
+  let summary = result[summaryKey].find(
+    (r) => r.tower === tower && r.category === "Non Compliance (>2 weeks)"
+  );
+  if (summary) {
+    summary.data += 1;
+  } else {
+    result[summaryKey].push({ tower, category: "Non Compliance (>2 weeks)", data: 1 });
+  }
+
+  // Add to details
+  details[detailKey].push({
+    ...device,
+    age: "N/A",
+    last_detection_date: "N/A",
+  });
+}
