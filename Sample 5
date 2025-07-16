@@ -1,0 +1,110 @@
+const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+const dotenv = require("dotenv");
+dotenv.config();
+
+const NCEP_URL = process.env.NCEP_URL;
+const ELK_URL = process.env.ELK_URL;
+const ELK_AUTH = {
+  username: process.env.ELK_USER,
+  password: process.env.ELK_PASS,
+};
+
+const deviceTagPath = path.join(__dirname, "../data/device_tag.json");
+const outputPath = path.join(__dirname, "../data/data.json");
+
+async function fetchAndProcess() {
+  try {
+    // Step 1: Fetch NCEP data
+    const ncepBody = {
+      keys: "dailyDeviceListToken",
+      attributes: ["hostname", "hwType", "model", "organisation", "status"],
+    };
+
+    const ncepResponse = await axios.post(NCEP_URL, ncepBody, {
+      headers: { "Content-Type": "application/json" },
+    });
+
+    const deviceList = ncepResponse.data;
+    console.log(`Fetched ${deviceList.length} devices from NCEP`);
+
+    // Step 2: Load tag mappings
+    const tagMap = JSON.parse(fs.readFileSync(deviceTagPath, "utf8"));
+
+    const data = {};
+    const processed = [];
+
+    for (const device of deviceList) {
+      const { hostname, hwType } = device;
+      if (!hostname || !hwType) continue;
+
+      let idr_result = "0"; // default
+
+      // Step 3: Query ELK with hostname
+      const elkBody = {
+        size: 1,
+        query: {
+          range: {
+            "@timestamp": {
+              gte: "now-30d/d",
+              lte: "now/d",
+            },
+          },
+        },
+        _source: ["hostname", "tags", "hw_type"],
+      };
+
+      elkBody.query.bool = {
+        must: [{ match: { hostname: hostname } }],
+      };
+
+      try {
+        const elkResponse = await axios.post(ELK_URL, elkBody, {
+          auth: ELK_AUTH,
+          headers: { "Content-Type": "application/json" },
+        });
+
+        const hits = elkResponse?.data?.hits?.hits;
+        if (!hits || hits.length === 0) {
+          idr_result = "0"; // no hits
+        } else {
+          const elkHost = hits[0]?._source || {};
+          const elkType = elkHost.hw_type;
+          const elkTag = elkHost.tags?.[0];
+
+          // Step 4: Match with tag map
+          const mappedTag = tagMap[hwType];
+
+          if (mappedTag === "NA") {
+            idr_result = "99"; // not applicable
+          } else if (!mappedTag) {
+            idr_result = "0"; // unknown hwType
+          } else if (elkTag === mappedTag) {
+            idr_result = "1"; // match
+          } else {
+            idr_result = "-1"; // wrong tag
+          }
+        }
+      } catch (err) {
+        console.error(`ELK error for ${hostname}:`, err.message);
+      }
+
+      data[hostname] = idr_result;
+      processed.push(device);
+    }
+
+    const output = {
+      date: new Date().toISOString().slice(0, 10),
+      data: processed,
+      result: data,
+    };
+
+    fs.writeFileSync(outputPath, JSON.stringify(output, null, 2));
+    console.log(`✅ Wrote ${processed.length} records to data.json`);
+  } catch (err) {
+    console.error("Error in fetchAndProcess:", err.message);
+  }
+}
+
+module.exports = fetchAndProcess;
