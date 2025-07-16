@@ -1,0 +1,124 @@
+const axios = require("axios");
+const https = require("https");
+const fs = require("fs");
+const path = require("path");
+const dotenv = require("dotenv");
+dotenv.config();
+
+const httpsAgent = new https.Agent({ rejectUnauthorized: false });
+
+const NCEP_URL = process.env.NCEP_URL;
+const ELK_URL = process.env.ELK_URL;
+const ELK_AUTH_HEADER = process.env.ELK_AUTH_HEADER;
+
+const tagMapPath = path.join(__dirname, "device_tag.json");
+const tagMap = JSON.parse(fs.readFileSync(tagMapPath, "utf-8"));
+
+async function fetchAndProcess() {
+  try {
+    const ncepBody = {}; // or your required NCEP request body
+    const ncepResponse = await axios.post(NCEP_URL, ncepBody, {
+      headers: { "Content-Type": "application/json" },
+      httpsAgent,
+    });
+
+    const deviceList = ncepResponse.data;
+    console.log(`Fetched ${deviceList.length} devices from NCEP`);
+
+    const data = {};
+
+    for (const device of deviceList) {
+      const { hostname, hwType } = device;
+      let idr_result = "0";
+      let complianceStatus = "Unknown";
+      let lastSeen = null;
+      let ageInDays = null;
+
+      const elkBody = {
+        query: {
+          bool: {
+            must: [
+              { match: { hostname } },
+              {
+                range: {
+                  "@timestamp": {
+                    gte: "now-30d/d",
+                    lte: "now/d",
+                  },
+                },
+              },
+            ],
+          },
+        },
+        size: 1,
+        sort: [{ "@timestamp": { order: "desc" } }],
+      };
+
+      try {
+        const elkResponse = await axios.post(ELK_URL, elkBody, {
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: ELK_AUTH_HEADER,
+          },
+          httpsAgent,
+        });
+
+        const hit = elkResponse?.data?.hits?.hits?.[0];
+
+        if (hit) {
+          const elkHost = hit._source || {};
+          lastSeen = elkHost["@timestamp"];
+          const elkTag = elkHost.tags?.[0];
+          const mappedTag = tagMap[hwType];
+
+          // Calculate age
+          if (lastSeen) {
+            const timeDiff = Date.now() - new Date(lastSeen).getTime();
+            ageInDays = Math.floor(timeDiff / (1000 * 60 * 60 * 24));
+
+            if (ageInDays <= 7) {
+              complianceStatus = "Compliance";
+            } else if (ageInDays <= 14) {
+              complianceStatus = "Non Compliance (<2 weeks)";
+            } else {
+              complianceStatus = "Non Compliance (>2 weeks)";
+            }
+          }
+
+          // Determine IDR result based on tag
+          if (mappedTag === "NA") {
+            idr_result = "99"; // not applicable
+          } else if (!mappedTag) {
+            idr_result = "0"; // unknown hwType
+          } else if (elkTag === mappedTag) {
+            idr_result = "1"; // match
+          } else {
+            idr_result = "-1"; // mismatch
+          }
+
+        } else {
+          // No ELK log found
+          idr_result = "0";
+        }
+      } catch (error) {
+        console.error(`ELK error for ${hostname}:`, error.response?.data || error.message);
+        idr_result = "0";
+      }
+
+      data[hostname] = {
+        idr_result,
+        complianceStatus,
+        lastSeen,
+        ageInDays,
+      };
+    }
+
+    const dataPath = path.join(__dirname, "data.json");
+    fs.writeFileSync(dataPath, JSON.stringify(data, null, 2));
+    console.log(`Results saved to ${dataPath}`);
+  } catch (err) {
+    console.error("Error in fetchAndProcess:", err.message);
+  }
+}
+
+fetchAndProcess();
