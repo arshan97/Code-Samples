@@ -16,7 +16,7 @@ const tagMap = JSON.parse(fs.readFileSync(tagMapPath, "utf-8"));
 
 async function fetchAndProcess() {
   try {
-    const ncepBody = {}; // or your required NCEP request body
+    const ncepBody = {}; // Your actual request body if needed
     const ncepResponse = await axios.post(NCEP_URL, ncepBody, {
       headers: { "Content-Type": "application/json" },
       httpsAgent,
@@ -65,13 +65,31 @@ async function fetchAndProcess() {
 
         const hit = elkResponse?.data?.hits?.hits?.[0];
 
-        if (hit) {
+        if (!hit) {
+          idr_result = "0";
+
+          data[hostname] = {
+            idr_result,
+            complianceStatus,
+            lastSeen,
+            ageInDays,
+          };
+        } else {
           const elkHost = hit._source || {};
-          lastSeen = elkHost["@timestamp"];
           const elkTag = elkHost.tags?.[0];
+          lastSeen = elkHost["@timestamp"];
           const mappedTag = tagMap[hwType];
 
-          // Calculate age
+          if (mappedTag === "NA") {
+            idr_result = "99";
+          } else if (!mappedTag) {
+            idr_result = "0";
+          } else if (elkTag === mappedTag) {
+            idr_result = "1";
+          } else {
+            idr_result = "-1";
+          }
+
           if (lastSeen) {
             const timeDiff = Date.now() - new Date(lastSeen).getTime();
             ageInDays = Math.floor(timeDiff / (1000 * 60 * 60 * 24));
@@ -85,32 +103,22 @@ async function fetchAndProcess() {
             }
           }
 
-          // Determine IDR result based on tag
-          if (mappedTag === "NA") {
-            idr_result = "99"; // not applicable
-          } else if (!mappedTag) {
-            idr_result = "0"; // unknown hwType
-          } else if (elkTag === mappedTag) {
-            idr_result = "1"; // match
-          } else {
-            idr_result = "-1"; // mismatch
-          }
-
-        } else {
-          // No ELK log found
-          idr_result = "0";
+          data[hostname] = {
+            idr_result,
+            complianceStatus,
+            lastSeen,
+            ageInDays,
+          };
         }
       } catch (error) {
         console.error(`ELK error for ${hostname}:`, error.response?.data || error.message);
-        idr_result = "0";
+        data[hostname] = {
+          idr_result: "0",
+          complianceStatus,
+          lastSeen,
+          ageInDays,
+        };
       }
-
-      data[hostname] = {
-        idr_result,
-        complianceStatus,
-        lastSeen,
-        ageInDays,
-      };
     }
 
     const dataPath = path.join(__dirname, "data.json");
