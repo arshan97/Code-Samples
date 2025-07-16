@@ -3,3 +3,46 @@ curl -XGET -k \
   "${url}" \
   -H "Content-Type: application/json" \
   -d "$(JSON.stringify({ query }))"
+
+const hit = elkResponse?.data?.hits?.hits?.[0];
+if (!hit) {
+  idr_result = "0"; // No ELK data
+} else {
+  const elkHost = hit._source || {};
+  const elkType = elkHost.hw_type;
+  const elkTag = elkHost.tags?.[0];
+
+  const lastSeen = hit._source["@timestamp"];
+  const ageInDays = lastSeen ? Math.floor((Date.now() - new Date(lastSeen)) / (1000 * 60 * 60 * 24)) : null;
+
+  let complianceStatus = "Unknown";
+  if (ageInDays !== null) {
+    if (ageInDays <= 7) {
+      complianceStatus = "Compliance";
+    } else if (ageInDays <= 14) {
+      complianceStatus = "Non Compliance (<2 weeks)";
+    } else {
+      complianceStatus = "Non Compliance (>2 weeks)";
+    }
+  }
+
+  const mappedTag = tagMap[hwType];
+
+  if (mappedTag === "NA") {
+    idr_result = "99"; // not applicable
+  } else if (!mappedTag) {
+    idr_result = "0"; // unknown hwType
+  } else if (elkTag === mappedTag) {
+    idr_result = "1"; // tag match
+  } else {
+    idr_result = "-1"; // tag mismatch
+  }
+
+  // Optionally store compliance info too
+  data[hostname] = {
+    idr_result,
+    complianceStatus,
+    lastSeen,
+    ageInDays,
+  };
+}
