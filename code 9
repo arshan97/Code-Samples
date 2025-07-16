@@ -1,0 +1,163 @@
+const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+const https = require("https");
+const dotenv = require("dotenv");
+dotenv.config();
+
+const NCEP_URL = process.env.NCEP_URL;
+const ELK_URL = process.env.ELK_URL;
+
+const ELK_AUTH = {
+  username: process.env.ELK_USER,
+  password: process.env.ELK_PASS,
+};
+
+const deviceTagPath = path.join(__dirname, "../data/device_tag.json");
+const outputPath = path.join(__dirname, "../data/data.json");
+
+const country_map = {
+  SG_DC: "SG",
+  SG_NONDC: "SG",
+  CN_NW: "CN",
+  HK_NW: "HK",
+  TW_NW: "TW",
+  ID_NW: "ID",
+  IN_NW: "IN",
+  CNSV_NW: "CN",
+  DBSVTH_NW: "TH",
+};
+
+const httpsAgent = new https.Agent({ rejectUnauthorized: false });
+
+function calculateCategory(age) {
+  if (age <= 7) return "Comply";
+  if (age <= 14) return "Non Compliance (< 2 weeks)";
+  return "Non Compliance (> 2 weeks)";
+}
+
+async function fetchAndProcess() {
+  try {
+    const ncepBody = {
+      keys: "dailyDeviceListToken",
+      attributes: [
+        "hostname", "mgmtIP", "hwType", "model", "ver", "vendor", "tower",
+        "zone", "subZone", "status", "country", "organization", "hccRemarks",
+        "role", "monitoringZone", "registeredDate", "decommisionDate",
+        "lastUpdateDateUser", "uptime", "internetFacing"
+      ]
+    };
+
+    const ncepResponse = await axios.post(NCEP_URL, ncepBody, {
+      headers: { "Content-Type": "application/json" },
+      httpsAgent,
+    });
+
+    const deviceList = ncepResponse.data;
+    console.log(`Fetched ${deviceList.length} devices from NCEP`);
+
+    const tagMap = JSON.parse(fs.readFileSync(deviceTagPath, "utf8"));
+    const countrySummary = {};
+    const countryDetail = {};
+
+    for (const device of deviceList) {
+      const {
+        hostname, hwType, organization, tower
+      } = device;
+      if (!hostname || !hwType || !organization) continue;
+
+      const countryCode = country_map[organization];
+      if (!countryCode) continue;
+
+      const countryKey = countryCode.toLowerCase();
+      if (!countrySummary[`data_${countryKey}`]) countrySummary[`data_${countryKey}`] = [];
+      if (!countryDetail[`detail_${countryKey}`]) countryDetail[`detail_${countryKey}`] = [];
+
+      let age = null;
+      let lastDetected = null;
+
+      const elkBody = {
+        size: 1,
+        sort: [{ "@timestamp": { order: "desc" } }],
+        query: {
+          bool: {
+            must: [
+              { match: { hostname: hostname } },
+              {
+                range: {
+                  "@timestamp": {
+                    gte: "now-30d/d",
+                    lte: "now/d"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        _source: ["@timestamp", "hostname", "tags", "hw_type"]
+      };
+
+      let elkTag = null;
+      try {
+        const elkResponse = await axios.post(ELK_URL, elkBody, {
+          auth: ELK_AUTH,
+          headers: { "Content-Type": "application/json" },
+          httpsAgent,
+        });
+
+        const hits = elkResponse?.data?.hits?.hits || [];
+        if (hits.length > 0) {
+          const hit = hits[0];
+          const timestamp = hit._source?.["@timestamp"];
+          if (timestamp) {
+            const detectedDate = new Date(timestamp);
+            lastDetected = detectedDate.toISOString().split("T")[0];
+            const today = new Date();
+            const diffTime = Math.abs(today - detectedDate);
+            age = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+          }
+
+          elkTag = hit._source?.tags?.[0];
+        }
+      } catch (err) {
+        console.error(`ELK error for ${hostname}:`, err.message);
+      }
+
+      const category = age !== null ? calculateCategory(age) : "Unknown";
+      const mappedTag = tagMap[hwType];
+
+      // --- Add to summary ---
+      const existing = countrySummary[`data_${countryKey}`].find(
+        (entry) => entry.tower === tower && entry.category === category
+      );
+      if (existing) {
+        existing.data += 1;
+      } else {
+        countrySummary[`data_${countryKey}`].push({
+          tower: tower || "Unknown",
+          category,
+          data: 1
+        });
+      }
+
+      // --- Add to detail ---
+      countryDetail[`detail_${countryKey}`].push({
+        ...device,
+        age: age ?? "NA",
+        last_detection_date: lastDetected ?? "NA"
+      });
+    }
+
+    const finalOutput = {
+      ...countrySummary,
+      ...countryDetail
+    };
+
+    fs.writeFileSync(outputPath, JSON.stringify(finalOutput, null, 2));
+    console.log(`✅ Wrote ${deviceList.length} records to data.json`);
+  } catch (err) {
+    console.error("Error in fetchAndProcess:", err.message);
+  }
+}
+
+module.exports = fetchAndProcess;
