@@ -1,0 +1,209 @@
+const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+const https = require("https");
+const dotenv = require("dotenv");
+dotenv.config();
+
+const NCEP_URL = process.env.NCEP_URL;
+const ELK_URL = process.env.ELK_URL;
+const ELK_AUTH = {
+  username: process.env.ELK_USER,
+  password: process.env.ELK_PASS,
+};
+
+const agent = new https.Agent({ rejectUnauthorized: false });
+
+const deviceTagPath = path.join(__dirname, "../data/device_tag.json");
+const outputPath = path.join(__dirname, "../data/data.json");
+const statePath = path.join(__dirname, "../data/age_state.json");
+
+const country_map = {
+  SG_DC: "SG",
+  SG_NONDC: "SG",
+  CN_NW: "CN",
+  HK_NW: "HK",
+  TW_NW: "TW",
+  ID_NW: "ID",
+  IN_NW: "IN",
+  CNSV: "CN",
+  DBSVTH_NW: "TH",
+};
+
+const categories = [
+  "Comply",
+  "Non Compliance (<2 weeks)",
+  "Non Compliance (>2 weeks)",
+  "Non Compliance (Not Applicable)",
+];
+
+function calculateAge(timestamp) {
+  const now = new Date();
+  const event = new Date(timestamp);
+  const diffMs = now - event;
+  return Math.floor(diffMs / (1000 * 60 * 60 * 24));
+}
+
+function categorize(age) {
+  if (age <= 7) return "Comply";
+  if (age <= 14) return "Non Compliance (<2 weeks)";
+  return "Non Compliance (>2 weeks)";
+}
+
+function loadAgeState() {
+  if (fs.existsSync(statePath)) {
+    return JSON.parse(fs.readFileSync(statePath, "utf8"));
+  }
+  return {};
+}
+
+function saveAgeState(state) {
+  fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+}
+
+async function fetchAndProcess() {
+  try {
+    const ncepBody = {
+      keys: "dailyDeviceListToken",
+      attributes: [
+        "hostname", "mgmtIP", "hwType", "model", "ver", "vendor",
+        "tower", "zone", "subZone", "status", "country", "organization",
+        "hccRemarks", "role", "monitoringZone", "registeredDate",
+        "decommisionDate", "lastUpdateDateUser", "uptime", "internetFacing"
+      ],
+    };
+
+    const ncepResponse = await axios.post(NCEP_URL, ncepBody, {
+      headers: { "Content-Type": "application/json" },
+    });
+
+    const deviceList = ncepResponse.data;
+    console.log(`Fetched ${deviceList.length} devices from NCEP`);
+
+    const tagMap = JSON.parse(fs.readFileSync(deviceTagPath, "utf8"));
+    const ageState = loadAgeState();
+    const today = new Date().toISOString().slice(0, 10);
+
+    const result = {};
+    const details = {};
+    const towerPerCountry = {};
+
+    // Pre-fill summaries
+    for (const device of deviceList) {
+      const { hostname, hwType, tower, organization } = device;
+      const country = country_map[organization];
+      if (!hostname || !hwType || !country || !tower) continue;
+
+      const summaryKey = `data_${country.toLowerCase()}`;
+      const detailKey = `detail_${country.toLowerCase()}`;
+      result[summaryKey] = result[summaryKey] || [];
+      details[detailKey] = details[detailKey] || [];
+
+      if (!towerPerCountry[country]) towerPerCountry[country] = new Set();
+      towerPerCountry[country].add(tower);
+    }
+
+    // Add all 4 categories for every tower
+    for (const [country, towers] of Object.entries(towerPerCountry)) {
+      const key = `data_${country.toLowerCase()}`;
+      const seen = new Set();
+      result[key] = result[key] || [];
+      for (const tower of towers) {
+        for (const category of categories) {
+          result[key].push({ tower, category, data: 0 });
+          seen.add(`${tower}::${category}`);
+        }
+      }
+    }
+
+    for (const device of deviceList) {
+      const { hostname, hwType, tower, organization } = device;
+      const country = country_map[organization];
+      if (!hostname || !hwType || !country || !tower) continue;
+
+      const summaryKey = `data_${country.toLowerCase()}`;
+      const detailKey = `detail_${country.toLowerCase()}`;
+
+      const elkBody = {
+        size: 1,
+        query: {
+          bool: {
+            must: [{ match: { hostname } }],
+            filter: {
+              range: {
+                "@timestamp": {
+                  gte: "now-30d/d",
+                  lte: "now/d",
+                },
+              },
+            },
+          },
+        },
+        _source: ["hostname", "tags", "hw_type", "@timestamp"],
+      };
+
+      let age, lastDetection;
+      let category = "Non Compliance (Not Applicable)";
+
+      try {
+        const elkResponse = await axios.post(ELK_URL, elkBody, {
+          auth: ELK_AUTH,
+          headers: { "Content-Type": "application/json" },
+          httpsAgent: agent,
+        });
+
+        const hits = elkResponse?.data?.hits?.hits;
+        if (hits && hits.length > 0) {
+          const src = hits[0]._source;
+          const elkTag = src.tags?.[0];
+          const expectedTag = tagMap[hwType];
+
+          if (expectedTag && elkTag === expectedTag) {
+            lastDetection = src["@timestamp"].slice(0, 10);
+            age = calculateAge(src["@timestamp"]);
+
+            category = categorize(age);
+            ageState[hostname] = { age, last_seen: lastDetection };
+          } else {
+            throw new Error("Tag mismatch");
+          }
+        } else throw new Error("No hit");
+      } catch {
+        const existing = ageState[hostname];
+        if (existing) {
+          age = existing.age + 1;
+          lastDetection = existing.last_seen;
+        } else {
+          age = 30;
+          lastDetection = new Date(Date.now() - 30 * 86400000)
+            .toISOString()
+            .slice(0, 10);
+        }
+        ageState[hostname] = { age, last_seen: lastDetection };
+        category = categorize(age);
+      }
+
+      // Summary increment
+      const bucket = result[summaryKey].find(
+        (r) => r.tower === tower && r.category === category
+      );
+      if (bucket) bucket.data += 1;
+
+      // Detail entry
+      details[detailKey].push({
+        ...device,
+        age,
+        last_detection_date: lastDetection,
+      });
+    }
+
+    const output = { ...result, ...details };
+    fs.writeFileSync(outputPath, JSON.stringify(output, null, 2));
+    saveAgeState(ageState);
+    console.log(`✅ Wrote final summary and details to data.json and updated age_state.json`);
+  } catch (err) {
+    console.error("Error in fetchAndProcess:", err.message);
+  }
+}
+
+module.exports = fetchAndProcess;
