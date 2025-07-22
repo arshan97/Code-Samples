@@ -1,0 +1,227 @@
+const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+const https = require("https");
+const dotenv = require("dotenv");
+dotenv.config();
+
+const agent = new https.Agent({ rejectUnauthorized: false });
+
+const NCEP_URL = process.env.NCEP_URL;
+const ELK_URL = process.env.ELK_URL;
+const NCEP_KEY = process.env.NCEP_KEY;
+const ELK_AUTH = process.env.ELK_AUTH; // base64 encoded string "user:pass"
+
+const deviceTagPath = path.join(__dirname, "../data/device_tag.json");
+const outputPath = path.join(__dirname, "../data/data.json");
+const statePath = path.join(__dirname, "../data/age_state.json");
+
+const country_map = {
+  SG_DC: "SG",
+  SG_NONDC: "SG",
+  CN_NW: "CN",
+  HK_NW: "HK",
+  TW_NW: "TW",
+  ID_NW: "ID",
+  IN_NW: "IN",
+  CNSJV: "SG",
+  DBSVTH_NW: "SG",
+};
+
+const categories = [
+  "Comply",
+  "Non Compliance (<2 weeks)",
+  "Non Compliance (>2 weeks)",
+  "Non Applicable",
+];
+
+function calculateAge(timestamp) {
+  const now = new Date();
+  const event = new Date(timestamp);
+  const diffMs = now - event;
+  return Math.floor(diffMs / (1000 * 60 * 60 * 24));
+}
+
+function categorize(age, isNA = false) {
+  if (isNA) return "Non Applicable";
+  if (age <= 7) return "Comply";
+  if (age <= 14) return "Non Compliance (<2 weeks)";
+  return "Non Compliance (>2 weeks)";
+}
+
+function loadAgeState() {
+  if (fs.existsSync(statePath)) {
+    return JSON.parse(fs.readFileSync(statePath, "utf8"));
+  }
+  return {};
+}
+
+function saveAgeState(state) {
+  fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+}
+
+function initializeSummary() {
+  const summary = {};
+  const towers = new Set();
+  for (const country of Object.values(country_map)) {
+    const key = `data_${country.toLowerCase()}`;
+    summary[key] = [];
+  }
+  return summary;
+}
+
+function ensureAllCombinations(summary, towers) {
+  for (const country of Object.values(country_map)) {
+    const key = `data_${country.toLowerCase()}`;
+    for (const tower of towers) {
+      for (const cat of categories) {
+        const exists = summary[key].some(
+          (e) => e.tower === tower && e.category === cat
+        );
+        if (!exists) {
+          summary[key].push({ tower, category: cat, data: 0 });
+        }
+      }
+    }
+  }
+}
+
+async function fetchAndProcess() {
+  try {
+    const ncepBody = {
+      keys: Buffer.from(NCEP_KEY, "base64").toString("utf-8"),
+      attributes: [
+        "hostname", "mgmtIP", "hwType", "model", "ver", "vendor",
+        "tower", "zone", "subZone", "status", "country", "organisation",
+        "hccRemarks", "role", "monitoringZone", "registeredDate",
+        "decommissionDate", "lastUpdateDateUser", "uptime", "internetFacing"
+      ],
+    };
+
+    const ncepResponse = await axios.post(NCEP_URL, ncepBody, {
+      headers: { "Content-Type": "application/json" },
+      httpsAgent: agent,
+    });
+
+    const deviceList = ncepResponse.data;
+    console.log(`Fetched ${deviceList.length} devices from NCEP`);
+
+    const tagMap = JSON.parse(fs.readFileSync(deviceTagPath, "utf8"));
+    const ageState = loadAgeState();
+
+    const result = initializeSummary();
+    const details = {};
+    const towersSet = new Set();
+
+    for (const device of deviceList) {
+      const { hostname, hwType, tower, organisation } = device;
+      if (!hostname || !hwType || !tower || !organisation) continue;
+
+      const orgCode = country_map[organisation] || "OTH";
+      const summaryKey = `data_${orgCode.toLowerCase()}`;
+      const detailKey = `detail_${orgCode.toLowerCase()}`;
+      details[detailKey] = details[detailKey] || [];
+
+      towersSet.add(tower);
+
+      const elkBody = {
+        size: 1,
+        query: {
+          bool: {
+            must: [{ match: { hostname } }],
+            filter: {
+              range: {
+                "@timestamp": {
+                  gte: "now-30d/d",
+                  lte: "now/d",
+                },
+              },
+            },
+          },
+        },
+        _source: ["hostname", "tags", "hw_type", "@timestamp"],
+      };
+
+      let age = 30;
+      let lastSeen = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      let isNA = false;
+
+      try {
+        const elkResp = await axios.post(ELK_URL, elkBody, {
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Basic ${ELK_AUTH}`,
+          },
+          httpsAgent: agent,
+        });
+
+        const hits = elkResp.data?.hits?.hits || [];
+
+        if (hits.length > 0) {
+          const hit = hits[0]._source;
+          age = calculateAge(hit["@timestamp"]);
+          lastSeen = hit["@timestamp"].slice(0, 10);
+
+          ageState[hostname] = {
+            age,
+            last_seen: hit["@timestamp"],
+          };
+        } else {
+          if (ageState[hostname]) {
+            age = ageState[hostname].age + 1;
+            lastSeen = new Date(
+              new Date(ageState[hostname].last_seen).getTime() +
+                age * 24 * 60 * 60 * 1000
+            )
+              .toISOString()
+              .slice(0, 10);
+            ageState[hostname].age = age;
+          } else {
+            ageState[hostname] = {
+              age,
+              last_seen: new Date(Date.now() - 30 * 86400000).toISOString(),
+            };
+          }
+        }
+      } catch (err) {
+        console.error(`ELK error for ${hostname}:`, err.message);
+      }
+
+      const mappedTag = tagMap[hwType];
+      isNA = mappedTag === "NA" || !mappedTag;
+
+      const category = categorize(age, isNA);
+
+      // Add to summary
+      let summaryEntry = result[summaryKey].find(
+        (e) => e.tower === tower && e.category === category
+      );
+      if (summaryEntry) {
+        summaryEntry.data += 1;
+      } else {
+        result[summaryKey].push({ tower, category, data: 1 });
+      }
+
+      // Add to details
+      details[detailKey].push({
+        ...device,
+        age,
+        last_detection_date: lastSeen,
+      });
+    }
+
+    // Ensure all 72 combinations exist
+    ensureAllCombinations(result, towersSet);
+
+    // Final output
+    const finalOutput = { ...result, ...details };
+    fs.writeFileSync(outputPath, JSON.stringify(finalOutput, null, 2));
+    saveAgeState(ageState);
+
+    console.log("✅ Process complete. Data written to data.json");
+  } catch (err) {
+    console.error("Error in fetchAndProcess:", err.message);
+  }
+}
+
+module.exports = fetchAndProcess;
