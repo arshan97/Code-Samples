@@ -1,0 +1,334 @@
+// fetchAndProcess.js
+const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+const https = require("https");
+const dotenv = require("dotenv");
+dotenv.config();
+
+const agent = new https.Agent({ rejectUnauthorized: false });
+
+// ---------- ENV ----------
+const NCEP_URL = process.env.NCEP_URL;
+const NCEP_KEY = process.env.NCEP_KEY;
+
+// Per-region ELK clusters (point these to the _search endpoint or base URL as you use)
+// Example: ELK_URL_SG="http://.../_search"  OR "http://.../index/_search"
+const ELK_CLUSTERS = {
+  SG: process.env.ELK_URL_SG,
+  CN: process.env.ELK_URL_CN,
+  HK: process.env.ELK_URL_HK,
+  TW: process.env.ELK_URL_TW,
+  ID: process.env.ELK_URL_ID,
+  IN: process.env.ELK_URL_IN,
+};
+
+// Per-region AUTH (base64 "user:pass" string). Example: "Basic dXNlcjpwYXNz"
+const ELK_AUTH_MAP = {
+  SG: process.env.ELK_AUTH_SG,
+  CN: process.env.ELK_AUTH_CN,
+  HK: process.env.ELK_AUTH_HK,
+  TW: process.env.ELK_AUTH_TW,
+  ID: process.env.ELK_AUTH_ID,
+  IN: process.env.ELK_AUTH_IN,
+};
+
+// ---------- PATHS ----------
+const deviceTagPath = path.join(__dirname, "../data/device_tag.json");
+const outputPath = path.join(__dirname, "../data/data.json");
+const statePath = path.join(__dirname, "../data/age_state.json");
+
+// ---------- MAPS ----------
+const elk_map = {
+  SG_DC: "SG",
+  SG_NONDC: "SG",
+  CN_NW: "CN",
+  HK_NW: "HK",
+  TW_NW: "TW",
+  ID_NW: "ID",
+  IN_NW: "IN",
+  CNSJV: "SG",
+  DBSVTH_NW: "SG",
+};
+
+const country_map = {
+  SG_DC: "SG",
+  SG_NONDC: "SG",
+  CN_NW: "CN",
+  HK_NW: "HK",
+  TW_NW: "TW",
+  ID_NW: "ID",
+  IN_NW: "IN",
+  CNSJV: "CNSJV",
+  DBSVTH_NW: "DBSVTH",
+};
+
+// Normalize NCEP towers into your 18 logical towers (dedup later)
+const tower_map = {
+  FIREWALL: "FIREWALL",
+  BUILDING: "BUILDING",
+  EXTRANET: "EXTRANET",
+  "DC-ADN": "SLB & DNS",
+  IDC: "IDC",
+  ENT: "ENT",
+  ICIS: "ICIS",
+  CA: "CA",
+  BRANCH: "BRANCH",
+  OBWAN: "OBWAN",
+  CNSJV: "CNSJV",
+  RAF: "PROXY",          // maps to PROXY
+  SSB: "ATM",
+  GNOC: "GNOC",
+  TAE: "TOOLS",
+  DDC: "DDC",
+  DBSVTH: "DBSVTH",
+  MOBILITY: "WIRELESS",
+  PROXY: "PROXY",
+};
+
+// Summary categories (include Pre-production as 5th bucket)
+const categories = [
+  "Comply",
+  "Non Compliance (<2 weeks)",
+  "Non Compliance (>2 weeks)",
+  "Non Applicable",
+  "Pre-production",
+];
+
+// ---------- HELPERS ----------
+function calculateAgeUTC(timestamp) {
+  // Calendar-day difference in UTC to avoid time-of-day rounding issues
+  const now = new Date();
+  const event = new Date(timestamp);
+  const utcToday = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  const utcEvent = Date.UTC(event.getUTCFullYear(), event.getUTCMonth(), event.getUTCDate());
+  return Math.floor((utcToday - utcEvent) / (1000 * 60 * 60 * 24));
+}
+
+function categorizeActive(age) {
+  // Active devices: 3-way split
+  if (age <= 7) return "Comply";
+  if (age <= 14) return "Non Compliance (<2 weeks)";
+  return "Non Compliance (>2 weeks)";
+}
+
+function categorizePreProd(ageOrNA) {
+  // Pre-production devices: Comply or Non Compliance (single bucket), or Non Applicable
+  if (ageOrNA === "Non Applicable") return "Non Applicable";
+  // Only two states based on age
+  return ageOrNA <= 7 ? "Comply" : "Non Compliance";
+}
+
+function loadAgeState() {
+  if (!fs.existsSync(statePath)) return {};
+  try {
+    const raw = fs.readFileSync(statePath, "utf8");
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    // if corrupted, start fresh
+    return {};
+  }
+}
+
+function saveAgeState(state) {
+  fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+}
+
+function initSummary(towerList) {
+  // Initialize all categories per tower for every country (data_<country>)
+  const result = {};
+  const uniqueCountries = new Set(Object.values(country_map)); // 8 keys
+  for (const country of uniqueCountries) {
+    const key = `data_${country.toLowerCase()}`;
+    result[key] = [];
+    for (const tower of towerList) {
+      for (const category of categories) {
+        result[key].push({ tower, category, data: 0 });
+      }
+    }
+  }
+  return result;
+}
+
+function getSummaryCategory(ncepStatus, complyStatus) {
+  // If device is Pre-production (NCEP field), its summary bucket is always "Pre-production"
+  if (typeof ncepStatus === "string" && ncepStatus.toLowerCase() === "pre-production") {
+    return "Pre-production";
+  }
+  // Otherwise, use compliance status
+  return complyStatus;
+}
+
+// ---------- MAIN ----------
+async function fetchAndProcess() {
+  try {
+    // NCEP payload
+    const ncepBody = {
+      keys: Buffer.from(NCEP_KEY, "base64").toString("utf-8"),
+      attributes: [
+        "hostname", "mgmtIP", "hwType", "model", "ver", "vendor", "tower",
+        "zone", "subZone", "status", "country", "organisation", "hccRemarks",
+        "role", "monitoringZone", "registeredDate", "decommissionDate",
+        "lastUpdateDateUser", "uptime", "internetFacing"
+      ],
+    };
+
+    const ncepResponse = await axios.post(NCEP_URL, ncepBody, {
+      headers: { "Content-Type": "application/json" },
+      httpsAgent: agent,
+    });
+
+    const deviceList = ncepResponse.data || [];
+    console.log(`Fetched ${deviceList.length} devices from NCEP`);
+
+    const tagMap = JSON.parse(fs.readFileSync(deviceTagPath, "utf8"));
+    const ageState = loadAgeState();
+
+    // Build normalized tower list from the actual devices and your map, then dedupe
+    const normalizedTowers = [
+      ...new Set(
+        deviceList.map((d) => (tower_map[d.tower] || d.tower)).filter(Boolean)
+      ),
+    ];
+
+    const result = initSummary(normalizedTowers);
+    const details = {};
+
+    for (const device of deviceList) {
+      const { hostname, hwType, organisation, tower, status } = device;
+      if (!hostname || !hwType || !organisation || !tower) continue;
+
+      const mappedTower = tower_map[tower] || tower;
+      const orgCode = country_map[organisation] || "OTH"; // group output by this
+      const elkRegion = elk_map[organisation] || "SG";    // choose ELK cluster by this
+      const elkURL = ELK_CLUSTERS[elkRegion];
+      const elkAuth = ELK_AUTH_MAP[elkRegion];
+
+      const summaryKey = `data_${orgCode.toLowerCase()}`;
+      const detailKey = `detail_${orgCode.toLowerCase()}`;
+      details[detailKey] = details[detailKey] || [];
+
+      // Map hwType -> ELK tag/type, default "syslog_0" for new/unknown types
+      const portType = (tagMap[hwType] || "syslog_0");
+      const isNA = tagMap[hwType] === "NA";
+
+      let age = 30;
+      let lastSeenISO = new Date(Date.now() - 30 * 86400000).toISOString(); // default backfill
+      let complyStatus;
+
+      // Pre-production vs Active path (by NCEP status)
+      const isPreProd = typeof status === "string" && status.toLowerCase() === "pre-production";
+
+      if (isNA) {
+        // Non Applicable devices: do not query ELK or track state
+        age = "Non Applicable";
+        lastSeenISO = "Non Applicable";
+        complyStatus = "Non Applicable";
+      } else {
+        // Query ELK for Active or Pre-production devices
+        const elkBody = {
+          size: 1,
+          query: {
+            bool: {
+              must: [
+                { match: { "hostname.keyword": hostname } },
+                // if your index supports a 'type' field filter:
+                ...(portType ? [{ match: { type: portType } }] : []),
+              ],
+              filter: {
+                range: {
+                  "@timestamp": { gte: "now-30d/d", lte: "now/d" },
+                },
+              },
+            },
+          },
+          _source: ["@timestamp"], // we only need timestamp here
+        };
+
+        try {
+          const elkResponse = await axios.post(elkURL, elkBody, {
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: elkAuth,
+            },
+            httpsAgent: agent,
+          });
+
+          const hits = elkResponse?.data?.hits?.hits || [];
+          if (hits.length > 0) {
+            const ts = hits[0]._source["@timestamp"];
+            lastSeenISO = ts;
+            age = calculateAgeUTC(ts);
+            // Track state only for applicable devices
+            ageState[hostname] = { age, lastSeen: lastSeenISO };
+          } else if (ageState[hostname]) {
+            // No hit today, use state to increment
+            age = ageState[hostname].age + 1;
+            // Back-calc a date-only representation from age
+            const d = new Date();
+            d.setUTCDate(d.getUTCDate() - age);
+            lastSeenISO = d.toISOString();
+            ageState[hostname] = { age, lastSeen: lastSeenISO };
+          } else {
+            // First time, no hit → assume 30 days old
+            const d = new Date();
+            d.setUTCDate(d.getUTCDate() - 30);
+            lastSeenISO = d.toISOString();
+            age = 30;
+            ageState[hostname] = { age, lastSeen: lastSeenISO };
+          }
+        } catch (err) {
+          console.error(`ELK error for ${hostname}:`, err.message);
+          // On ELK error, still age from state if exists, else default 30
+          if (ageState[hostname]) {
+            age = ageState[hostname].age + 1;
+            const d = new Date();
+            d.setUTCDate(d.getUTCDate() - age);
+            lastSeenISO = d.toISOString();
+            ageState[hostname] = { age, lastSeen: lastSeenISO };
+          } else {
+            const d = new Date();
+            d.setUTCDate(d.getUTCDate() - 30);
+            lastSeenISO = d.toISOString();
+            age = 30;
+            ageState[hostname] = { age, lastSeen: lastSeenISO };
+          }
+        }
+
+        // Choose compliance label based on Active vs Pre-production
+        if (isPreProd) {
+          complyStatus = categorizePreProd(age);
+        } else {
+          complyStatus = categorizeActive(age);
+        }
+      }
+
+      // Summary bucket: "Pre-production" only for devices with NCEP status=Pre-production.
+      const summaryCategory = getSummaryCategory(status, complyStatus);
+      const summaryArr = result[summaryKey];
+      const bucket = summaryArr.find(
+        (r) => r.tower === mappedTower && r.category === summaryCategory
+      );
+      if (bucket) bucket.data += 1;
+
+      // Details row: always include complyStatus; for NA show "Non Applicable" fields
+      details[detailKey].push({
+        ...device,
+        age: complyStatus === "Non Applicable" ? "Non Applicable" : age,
+        last_detection_date:
+          complyStatus === "Non Applicable" ? "Non Applicable" : lastSeenISO.slice(0, 10),
+        complyStatus, // "Comply" / "Non Compliance"/ "<2 weeks"/ ">2 weeks" / "Non Applicable"
+      });
+    }
+
+    // Final write
+    const finalOutput = { ...result, ...details };
+    fs.writeFileSync(outputPath, JSON.stringify(finalOutput, null, 2));
+    saveAgeState(ageState);
+    console.log("✅ Final output written and state saved.");
+  } catch (err) {
+    console.error("Error in fetchAndProcess:", err.message);
+  }
+}
+
+module.exports = fetchAndProcess;
