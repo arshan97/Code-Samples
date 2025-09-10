@@ -1,0 +1,578 @@
+"use client"
+
+import { useEffect, useState, useCallback } from "react"
+import { Card, CardContent } from "@/components/ui/card"
+import { cn } from "@/lib/utils"
+import { Clock, Calendar, AlertTriangle } from "lucide-react"
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
+import { useHistoryStore, type TimelineDataPoint } from "@/utils/history-store"
+import { format, formatDistanceToNow } from "date-fns"
+
+export function HealthTimeline({
+  onTimeSelect,
+  lastUpdated,
+}: {
+  onTimeSelect?: (time: string) => void
+  lastUpdated?: Date | null
+}) {
+  const { timelinePoints, selectedTimePoint, setSelectedTimePoint } = useHistoryStore()
+
+  const handleTimeClick = (item: TimelineDataPoint) => {
+    // Mark this as a manual selection
+    setSelectedTimePoint(item, true)
+
+    // Call the onTimeSelect callback if provided
+    if (onTimeSelect) {
+      onTimeSelect(item.label)
+    }
+  }
+
+  // Function to determine if data is stale (older than 10 minutes)
+  const isDataStale = useCallback(() => {
+    if (!lastUpdated) return true
+    const now = new Date()
+    const timeDiff = now.getTime() - lastUpdated.getTime()
+    return timeDiff > 10 * 60 * 1000 // 10 minutes in milliseconds
+  }, [lastUpdated])
+
+  // Function to get the display text for last updated
+  const getLastUpdatedDisplay = useCallback(() => {
+    if (!lastUpdated) {
+      return "No data available"
+    }
+
+    const now = new Date()
+    const timeDiff = now.getTime() - lastUpdated.getTime()
+
+    // If less than 1 minute, show "Just now"
+    if (timeDiff < 60 * 1000) {
+      return "Just now"
+    }
+
+    // If less than 1 hour, show minutes ago
+    if (timeDiff < 60 * 60 * 1000) {
+      const minutes = Math.floor(timeDiff / (60 * 1000))
+      return `${minutes}m ago`
+    }
+
+    // If less than 24 hours, show hours and minutes ago
+    if (timeDiff < 24 * 60 * 60 * 1000) {
+      const hours = Math.floor(timeDiff / (60 * 60 * 1000))
+      const minutes = Math.floor((timeDiff % (60 * 60 * 1000)) / (60 * 1000))
+      return `${hours}h ${minutes}m ago`
+    }
+
+    // If more than 24 hours, show the actual date and time
+    return format(lastUpdated, "MMM d, h:mm a")
+  }, [lastUpdated])
+
+  // Update the display every minute
+  const [displayText, setDisplayText] = useState(getLastUpdatedDisplay())
+
+  useEffect(() => {
+    setDisplayText(getLastUpdatedDisplay())
+
+    const intervalId = setInterval(() => {
+      setDisplayText(getLastUpdatedDisplay())
+    }, 60000) // Update every minute
+
+    return () => clearInterval(intervalId)
+  }, [getLastUpdatedDisplay])
+
+  const stale = isDataStale()
+
+  return (
+    <Card className="bg-card shadow-lg">
+      <CardContent className="p-3">
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <Calendar className="w-4 h-4 text-primary" />
+            <span className="text-sm font-medium">Monitoring Timeline</span>
+          </div>
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <div
+                  className={cn(
+                    "flex items-center text-xs transition-colors",
+                    stale ? "text-amber-400" : "text-muted-foreground",
+                  )}
+                >
+                  {stale && <AlertTriangle className="w-3 h-3 mr-1" />}
+                  <Clock className="w-3 h-3 mr-1" />
+                  <span className="font-medium">{displayText}</span>
+                </div>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="text-xs p-2 bg-card border border-border">
+                <div className="space-y-1">
+                  {lastUpdated ? (
+                    <>
+                      <p className="font-semibold">{stale ? "Data may be stale" : "Last updated"}</p>
+                      <p>Date: {format(lastUpdated, "MMM d, yyyy")}</p>
+                      <p>Time: {format(lastUpdated, "h:mm:ss a")}</p>
+                      <p className="text-muted-foreground text-[10px]">
+                        ({formatDistanceToNow(lastUpdated, { addSuffix: true })})
+                      </p>
+                      {stale && <p className="text-amber-400 text-[10px]">Data is more than 10 minutes old</p>}
+                    </>
+                  ) : (
+                    <>
+                      <p className="font-semibold text-red-400">No data available</p>
+                      <p className="text-muted-foreground text-[10px]">Backend may have failed to provide data</p>
+                    </>
+                  )}
+                </div>
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        </div>
+        <div className="relative">
+          <div className="absolute top-1/2 left-0 right-0 h-0.5 bg-blue-500 transform -translate-y-1/2" />
+          <div className="relative flex justify-between items-center">
+            {timelinePoints.map((item, index) => (
+              <TooltipProvider key={index}>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      className="flex flex-col items-center focus:outline-none group"
+                      onClick={() => handleTimeClick(item)}
+                      aria-label={`Select time: ${item.label}`}
+                    >
+                      <div
+                        className={cn(
+                          "w-3 h-3 rounded-full border-2 border-blue-500 bg-background transition-all",
+                          selectedTimePoint?.timestamp.getTime() === item.timestamp.getTime() && "w-4 h-4 bg-blue-500",
+                          item.isLatest && "ring-2 ring-blue-500 ring-offset-1 ring-offset-background",
+                        )}
+                      />
+                      <span
+                        className={cn(
+                          "mt-1 text-[10px] font-medium transition-colors whitespace-nowrap",
+                          selectedTimePoint?.timestamp.getTime() === item.timestamp.getTime() &&
+                            "text-blue-600 font-bold",
+                        )}
+                      >
+                        {item.label}
+                      </span>
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom" className="text-xs p-2 bg-card border border-border">
+                    <div className="space-y-1">
+                      <p className="font-semibold">{item.isLatest ? "Latest Data" : "Historical Data"}</p>
+                      <p>Date: {format(item.timestamp, "MMM d, yyyy")}</p>
+                      <p>Time: {format(item.timestamp, "h:mm:ss a")}</p>
+                      {item.isLatest ? (
+                        <p className="text-blue-600 text-[10px]">
+                          ({formatDistanceToNow(item.timestamp, { addSuffix: true })})
+                        </p>
+                      ) : (
+                        <p className="text-muted-foreground text-[10px]">
+                          ({formatDistanceToNow(item.timestamp, { addSuffix: true })})
+                        </p>
+                      )}
+                    </div>
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            ))}
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+
+
+
+"use client"
+
+import { useState, useEffect, useCallback } from "react"
+import { fetchMonitoringData } from "@/services/monitoring-service"
+import {
+  parseDNSProtectionData,
+  parseTelcoOthersData,
+  parseDNSRecordsData,
+  parseAkamaiCDNData,
+  parseCloudflareData,
+  parseCleanPipeData,
+  extractTimestamps,
+} from "@/utils/data-parser"
+import type { DDoSProtection, ServiceProvider, CDNService } from "@/types/dashboard"
+import { setupPolling } from "@/utils/polling"
+import { useHistoryStore } from "@/utils/history-store"
+import type { CDNService as CDNServiceType, ServiceProvider as ServiceProviderType } from "../types"
+
+// Define the 6 app codes we want to keep
+const APP_CODES = ["IB88", "MIBS", "P2P-SG", "IWSM", "IDEAL", "IDEAL-Mobile"]
+
+// Map service names to app codes for consistent naming
+const SERVICE_TO_APP_CODE: Record<string, string> = {
+  "Internet Banking": "IB88",
+  "Mobile Banking": "MIBS",
+  Paylah: "P2P-SG",
+  iWealth: "IWSM",
+  IDEAL: "IDEAL",
+  "IDEAL Mobile": "IDEAL-Mobile",
+  // Add direct mappings for group names
+  IB88: "IB88",
+  MIBS: "MIBS",
+  "P2P-SG": "P2P-SG",
+  IWSM: "IWSM",
+  IDEAL: "IDEAL",
+  "IDEAL-Mobile": "IDEAL-Mobile",
+}
+
+// Map app codes to service names for display
+const APP_CODE_TO_SERVICE: Record<string, string> = {
+  IB88: "Internet Banking",
+  MIBS: "Mobile Banking",
+  "P2P-SG": "Paylah",
+  IWSM: "iWealth",
+  IDEAL: "IDEAL",
+  "IDEAL-Mobile": "IDEAL Mobile",
+}
+
+// Helper function to parse all data for a specific timestamp
+function parseAllData(data: any, targetTimestamp?: Date) {
+  // 1. Parse DNS Protection data
+  const dnsProtection = parseDNSProtectionData(data, targetTimestamp)
+
+  // 2. Parse Service Providers data
+  const { services, othersData } = parseTelcoOthersData(data, targetTimestamp)
+
+  // Filter services to only include the 6 app codes
+  const filteredServices = services.filter((service) => APP_CODES.includes(SERVICE_TO_APP_CODE[service] || service))
+
+  // Create service providers from the data
+  const serviceProviders: ServiceProviderType[] = [
+    {
+      name: "StarHub",
+      services: filteredServices.map((service) => ({
+        name: service,
+        code: SERVICE_TO_APP_CODE[service] || service,
+        status: "healthy",
+      })),
+    },
+    {
+      name: "Singtel",
+      services: filteredServices.map((service) => ({
+        name: service,
+        code: SERVICE_TO_APP_CODE[service] || service,
+        status: "healthy",
+      })),
+    },
+    {
+      name: "M1",
+      services: filteredServices.map((service) => ({
+        name: service,
+        code: SERVICE_TO_APP_CODE[service] || service,
+        status: "healthy",
+      })),
+    },
+    {
+      name: "Others",
+      services: othersData
+        .filter((item) => APP_CODES.includes(SERVICE_TO_APP_CODE[item.name] || item.name))
+        .map((item) => ({
+          name: item.name,
+          code: SERVICE_TO_APP_CODE[item.name] || item.name,
+          status: item.status,
+          responseTime: item.responseTime,
+          timestamp: item.timestamp,
+        })),
+    },
+  ]
+
+  // 3. Parse DNS Records data
+  const dnsRecords = parseDNSRecordsData(data, targetTimestamp)
+
+  // 4. Parse Clean Pipe data
+  const cleanPipeStatuses = parseCleanPipeData(data, targetTimestamp)
+
+  // 5. Parse CDN data
+  const akamaiData = parseAkamaiCDNData(data, targetTimestamp)
+  const cloudflareData = parseCloudflareData(data, targetTimestamp)
+
+  // Function to check if both DCE and DCW are critical for a provider
+  const isProviderBothDCEAndDCWCritical = (provider: string) => {
+    const providerData = cleanPipeStatuses[provider as keyof typeof cleanPipeStatuses]
+    if (!providerData) return false
+
+    // Get the first service to check DCE and DCW status
+    // Since all services for a provider have the same DCE and DCW status
+    const firstServiceKey = Object.keys(providerData)[0]
+    if (!firstServiceKey) return false
+
+    const serviceData = providerData[firstServiceKey]
+    return serviceData.dceStatus === "critical" && serviceData.dcwStatus === "critical"
+  }
+
+  // Check if either provider has both DCE and DCW critical
+  const akamaiCleanPipeCritical = isProviderBothDCEAndDCWCritical("akamai")
+  const cloudflareCleanPipeCritical = isProviderBothDCEAndDCWCritical("cloudflare")
+
+  // Create CDN services for the 6 app codes
+  const cdnServices: CDNServiceType[] = APP_CODES.map((appCode) => {
+    const serviceName = APP_CODE_TO_SERVICE[appCode] || appCode
+
+    // Find the matching Akamai service by group name
+    const akamaiService = akamaiData.find((s) => s.name === appCode || SERVICE_TO_APP_CODE[s.name] === appCode)
+
+    // Find the matching Cloudflare service by group name
+    const cloudflareService = cloudflareData.find((s) => s.name === appCode || SERVICE_TO_APP_CODE[s.name] === appCode)
+
+    // If both DCE and DCW are critical for a provider, all CDN services for that provider should be critical
+    const akamaiStatus = akamaiCleanPipeCritical ? "critical" : akamaiService?.status || "unknown"
+    const cloudflareStatus = cloudflareCleanPipeCritical ? "critical" : cloudflareService?.status || "unknown"
+
+    return {
+      name: serviceName,
+      code: appCode,
+      akamai: {
+        status: akamaiStatus,
+        active: akamaiService?.isActive || false,
+        responseTime: akamaiService?.responseTime,
+        timestamp: akamaiService?.timestamp,
+      },
+      cloudflare: {
+        status: cloudflareStatus,
+        active: cloudflareService?.isActive || false,
+        responseTime: cloudflareService?.responseTime,
+        timestamp: cloudflareService?.timestamp,
+      },
+    }
+  })
+
+  return {
+    dnsProtection,
+    serviceProviders,
+    dnsRecords,
+    cdnServices,
+    cleanPipeStatuses,
+  }
+}
+
+export function useMonitoringData() {
+  // State for all data sections
+  const [dnsProtection, setDnsProtection] = useState<DDoSProtection[]>([])
+  const [serviceProviders, setServiceProviders] = useState<ServiceProvider[]>([])
+  const [dnsRecords, setDnsRecords] = useState<DDoSProtection[]>([])
+  const [cdnServices, setCdnServices] = useState<CDNService[]>([])
+  const [cleanPipeStatuses, setCleanPipeStatuses] = useState<{
+    akamai: Record<string, any>
+    cloudflare: Record<string, any>
+  }>({
+    akamai: {},
+    cloudflare: {},
+  })
+
+  // Common state
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<Error | null>(null)
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
+  const [rawData, setRawData] = useState<any>(null)
+
+  // Get the selected time point from the history store
+  const { selectedTimePoint, setRawTimestamps } = useHistoryStore()
+
+  // Function to fetch and parse all data
+  const fetchData = useCallback(async () => {
+    try {
+      setLoading(true)
+      console.log(`[${new Date().toISOString()}] Fetching monitoring data...`)
+
+      // Fetch the monitoring data
+      const data = await fetchMonitoringData()
+      setRawData(data)
+
+      // Extract all timestamps from the data
+      const timestamps = extractTimestamps(data)
+      setRawTimestamps(timestamps)
+
+      // Get the target timestamp if we're viewing historical data
+      const targetTimestamp = selectedTimePoint && !selectedTimePoint.isLatest ? selectedTimePoint.timestamp : undefined
+
+      // Parse all data for the target timestamp
+      const parsedData = parseAllData(data, targetTimestamp)
+
+      // Set the last updated timestamp
+      let updatedTimestamp: Date
+      if (targetTimestamp) {
+        // If viewing historical data, use the target timestamp
+        updatedTimestamp = targetTimestamp
+      } else if (timestamps.length > 0) {
+        // Otherwise use the latest timestamp from the data
+        updatedTimestamp = timestamps[timestamps.length - 1]
+      } else {
+        // Only as a last resort, use current time
+        updatedTimestamp = new Date()
+      }
+
+      // Update state with parsed data
+      setDnsProtection(parsedData.dnsProtection)
+      setServiceProviders(parsedData.serviceProviders)
+      setDnsRecords(parsedData.dnsRecords)
+      setCdnServices(parsedData.cdnServices)
+      setCleanPipeStatuses(parsedData.cleanPipeStatuses)
+      setLastUpdated(updatedTimestamp)
+      setError(null)
+
+      console.log(`[${new Date().toISOString()}] Data fetched and parsed successfully`)
+    } catch (err) {
+      console.error("Failed to fetch monitoring data:", err)
+      setError(err instanceof Error ? err : new Error(String(err)))
+    } finally {
+      setLoading(false)
+    }
+  }, [selectedTimePoint, setRawTimestamps]) // Note: setRawTimestamps will handle auto-selection logic
+
+  // Effect to update displayed data when selected time point changes
+  useEffect(() => {
+    if (!selectedTimePoint || !rawData) return
+
+    try {
+      // Get the target timestamp
+      const targetTimestamp = selectedTimePoint.timestamp
+
+      // Parse all data for the selected timestamp
+      const parsedData = parseAllData(rawData, targetTimestamp)
+
+      // Update state with parsed data
+      setDnsProtection(parsedData.dnsProtection)
+      setServiceProviders(parsedData.serviceProviders)
+      setDnsRecords(parsedData.dnsRecords)
+      setCdnServices(parsedData.cdnServices)
+      setCleanPipeStatuses(parsedData.cleanPipeStatuses)
+      setLastUpdated(targetTimestamp)
+    } catch (err) {
+      console.error("Error parsing data for selected timestamp:", err)
+    }
+  }, [selectedTimePoint, rawData])
+
+  // Set up polling
+  useEffect(() => {
+    const cleanup = setupPolling(fetchData)
+    return cleanup
+  }, [fetchData])
+
+  // Function to manually refresh data
+  const refreshData = useCallback(() => {
+    return fetchData()
+  }, [fetchData])
+
+  return {
+    dnsProtection,
+    serviceProviders,
+    dnsRecords,
+    cdnServices,
+    cleanPipeStatuses,
+    loading,
+    error,
+    lastUpdated,
+    refreshData,
+  }
+}
+
+
+
+import { create } from "zustand"
+import { format } from "date-fns"
+
+// Define a type for our timeline data points
+export interface TimelineDataPoint {
+  timestamp: Date
+  label: string
+  isLatest: boolean
+}
+
+// Define the store state
+interface HistoryState {
+  // Timeline points
+  timelinePoints: TimelineDataPoint[]
+  // Selected timeline point
+  selectedTimePoint: TimelineDataPoint | null
+  // Raw timestamps from the JSON
+  rawTimestamps: Date[]
+  // Track if user has made a manual selection
+  hasManualSelection: boolean
+  // Actions
+  setTimelinePoints: (points: TimelineDataPoint[]) => void
+  setRawTimestamps: (timestamps: Date[]) => void
+  generateTimelineFromTimestamps: () => void
+  setSelectedTimePoint: (point: TimelineDataPoint | null, isManual?: boolean) => void
+}
+
+// Create the store
+export const useHistoryStore = create<HistoryState>((set, get) => ({
+  timelinePoints: [],
+  selectedTimePoint: null,
+  rawTimestamps: [],
+  hasManualSelection: false,
+
+  setTimelinePoints: (points) => set({ timelinePoints: points }),
+
+  setRawTimestamps: (timestamps) => {
+    set({ rawTimestamps: timestamps })
+    // After setting raw timestamps, generate the timeline
+    get().generateTimelineFromTimestamps()
+  },
+
+  generateTimelineFromTimestamps: () => {
+    const { rawTimestamps, hasManualSelection } = get()
+
+    if (rawTimestamps.length === 0) {
+      // If no timestamps, create a default point with current time
+      const now = new Date()
+      const defaultPoint = {
+        timestamp: now,
+        label: format(now, "h:mm a"),
+        isLatest: true,
+      }
+
+      set({
+        timelinePoints: [defaultPoint],
+        selectedTimePoint: defaultPoint,
+        hasManualSelection: false,
+      })
+      return
+    }
+
+    // Sort timestamps in ascending order (oldest first)
+    const sortedTimestamps = [...rawTimestamps].sort((a, b) => a.getTime() - b.getTime())
+
+    // Create timeline points from all timestamps
+    const timelinePoints: TimelineDataPoint[] = sortedTimestamps.map((timestamp, index) => {
+      const isLatest = index === sortedTimestamps.length - 1
+      return {
+        timestamp,
+        label: format(timestamp, "h:mm a"),
+        isLatest,
+      }
+    })
+
+    set({ timelinePoints })
+
+    // Auto-select latest point only if:
+    // 1. No point is currently selected (initial load), OR
+    // 2. User hasn't made a manual selection (polling refresh)
+    const { selectedTimePoint } = get()
+    if (!selectedTimePoint || !hasManualSelection) {
+      const latestPoint = timelinePoints[timelinePoints.length - 1]
+      if (latestPoint) {
+        set({
+          selectedTimePoint: latestPoint,
+          // Don't change hasManualSelection flag here - this is automatic selection
+        })
+      }
+    }
+  },
+
+  setSelectedTimePoint: (point, isManual = false) => {
+    set({
+      selectedTimePoint: point,
+      // Set hasManualSelection to true only if this is a manual selection
+      hasManualSelection: isManual ? true : get().hasManualSelection,
+    })
+  },
+}))
