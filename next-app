@@ -1,276 +1,114 @@
-"use client"
+import { create } from "zustand"
+import { format } from "date-fns"
 
-import { useState, useEffect, useCallback } from "react"
-import { fetchMonitoringData } from "@/services/monitoring-service"
-import {
-  parseDNSProtectionData,
-  parseTelcoOthersData,
-  parseDNSRecordsData,
-  parseAkamaiCDNData,
-  parseCloudflareData,
-  parseCleanPipeData,
-  extractTimestamps,
-} from "@/utils/data-parser"
-import type { DDoSProtection, ServiceProvider, CDNService } from "@/types/dashboard"
-import { setupPolling } from "@/utils/polling"
-import { useHistoryStore } from "@/utils/history-store"
-import type { CDNService as CDNServiceType, ServiceProvider as ServiceProviderType } from "../types"
-
-// Define the 6 app codes we want to keep
-const APP_CODES = ["IB88", "MIBS", "P2P-SG", "IWSM", "IDEAL", "IDEAL-Mobile"]
-
-// Map service names to app codes for consistent naming
-const SERVICE_TO_APP_CODE: Record<string, string> = {
-  "Internet Banking": "IB88",
-  "Mobile Banking": "MIBS",
-  Paylah: "P2P-SG",
-  iWealth: "IWSM",
-  IDEAL: "IDEAL",
-  "IDEAL Mobile": "IDEAL-Mobile",
-  // Add direct mappings for group names
-  IB88: "IB88",
-  MIBS: "MIBS",
-  "P2P-SG": "P2P-SG",
-  IWSM: "IWSM",
-  IDEAL: "IDEAL",
-  "IDEAL-Mobile": "IDEAL-Mobile",
+// Define a type for our timeline data points
+export interface TimelineDataPoint {
+  timestamp: Date
+  label: string
+  isLatest: boolean
 }
 
-// Map app codes to service names for display
-const APP_CODE_TO_SERVICE: Record<string, string> = {
-  IB88: "Internet Banking",
-  MIBS: "Mobile Banking",
-  "P2P-SG": "Paylah",
-  IWSM: "iWealth",
-  IDEAL: "IDEAL",
-  "IDEAL-Mobile": "IDEAL Mobile",
+// Define the store state
+interface HistoryState {
+  // Timeline points
+  timelinePoints: TimelineDataPoint[]
+  // Selected timeline point
+  selectedTimePoint: TimelineDataPoint | null
+  // Raw timestamps from the JSON
+  rawTimestamps: Date[]
+  // Track if user has made a manual selection
+  hasManualSelection: boolean
+  // Actions
+  setTimelinePoints: (points: TimelineDataPoint[]) => void
+  setRawTimestamps: (timestamps: Date[]) => void
+  generateTimelineFromTimestamps: () => void
+  setSelectedTimePoint: (point: TimelineDataPoint | null, isManual?: boolean) => void
+  // New action to force auto-select latest on polling
+  autoSelectLatestOnPolling: () => void
 }
 
-// Helper function to parse all data for a specific timestamp
-function parseAllData(data: any, targetTimestamp?: Date) {
-  // 1. Parse DNS Protection data
-  const dnsProtection = parseDNSProtectionData(data, targetTimestamp)
+// Create the store
+export const useHistoryStore = create<HistoryState>((set, get) => ({
+  timelinePoints: [],
+  selectedTimePoint: null,
+  rawTimestamps: [],
+  hasManualSelection: false,
 
-  // 2. Parse Service Providers data
-  const { services, othersData } = parseTelcoOthersData(data, targetTimestamp)
+  setTimelinePoints: (points) => set({ timelinePoints: points }),
 
-  // Filter services to only include the 6 app codes
-  const filteredServices = services.filter((service) => APP_CODES.includes(SERVICE_TO_APP_CODE[service] || service))
+  setRawTimestamps: (timestamps) => {
+    set({ rawTimestamps: timestamps })
+    // After setting raw timestamps, generate the timeline
+    get().generateTimelineFromTimestamps()
+  },
 
-  // Create service providers from the data
-  const serviceProviders: ServiceProviderType[] = [
-    {
-      name: "StarHub",
-      services: filteredServices.map((service) => ({
-        name: service,
-        code: SERVICE_TO_APP_CODE[service] || service,
-        status: "healthy",
-      })),
-    },
-    {
-      name: "Singtel",
-      services: filteredServices.map((service) => ({
-        name: service,
-        code: SERVICE_TO_APP_CODE[service] || service,
-        status: "healthy",
-      })),
-    },
-    {
-      name: "M1",
-      services: filteredServices.map((service) => ({
-        name: service,
-        code: SERVICE_TO_APP_CODE[service] || service,
-        status: "healthy",
-      })),
-    },
-    {
-      name: "Others",
-      services: othersData
-        .filter((item) => APP_CODES.includes(SERVICE_TO_APP_CODE[item.name] || item.name))
-        .map((item) => ({
-          name: item.name,
-          code: SERVICE_TO_APP_CODE[item.name] || item.name,
-          status: item.status,
-          responseTime: item.responseTime,
-          timestamp: item.timestamp,
-        })),
-    },
-  ]
+  generateTimelineFromTimestamps: () => {
+    const { rawTimestamps, hasManualSelection, selectedTimePoint } = get()
 
-  // 3. Parse DNS Records data
-  const dnsRecords = parseDNSRecordsData(data, targetTimestamp)
-
-  // 4. Parse Clean Pipe data
-  const cleanPipeStatuses = parseCleanPipeData(data, targetTimestamp)
-
-  // 5. Parse CDN data
-  const akamaiData = parseAkamaiCDNData(data, targetTimestamp)
-  const cloudflareData = parseCloudflareData(data, targetTimestamp)
-
-  // Function to check if both DCE and DCW are critical for a provider
-  const isProviderBothDCEAndDCWCritical = (provider: string) => {
-    const providerData = cleanPipeStatuses[provider as keyof typeof cleanPipeStatuses]
-    if (!providerData) return false
-
-    // Get the first service to check DCE and DCW status
-    // Since all services for a provider have the same DCE and DCW status
-    const firstServiceKey = Object.keys(providerData)[0]
-    if (!firstServiceKey) return false
-
-    const serviceData = providerData[firstServiceKey]
-    return serviceData.dceStatus === "critical" && serviceData.dcwStatus === "critical"
-  }
-
-  // Check if either provider has both DCE and DCW critical
-  const akamaiCleanPipeCritical = isProviderBothDCEAndDCWCritical("akamai")
-  const cloudflareCleanPipeCritical = isProviderBothDCEAndDCWCritical("cloudflare")
-
-  // Create CDN services for the 6 app codes
-  const cdnServices: CDNServiceType[] = APP_CODES.map((appCode) => {
-    const serviceName = APP_CODE_TO_SERVICE[appCode] || appCode
-
-    // Find the matching Akamai service by group name
-    const akamaiService = akamaiData.find((s) => s.name === appCode || SERVICE_TO_APP_CODE[s.name] === appCode)
-
-    // Find the matching Cloudflare service by group name
-    const cloudflareService = cloudflareData.find((s) => s.name === appCode || SERVICE_TO_APP_CODE[s.name] === appCode)
-
-    // If both DCE and DCW are critical for a provider, all CDN services for that provider should be critical
-    const akamaiStatus = akamaiCleanPipeCritical ? "critical" : akamaiService?.status || "unknown"
-    const cloudflareStatus = cloudflareCleanPipeCritical ? "critical" : cloudflareService?.status || "unknown"
-
-    return {
-      name: serviceName,
-      code: appCode,
-      akamai: {
-        status: akamaiStatus,
-        active: akamaiService?.isActive || false,
-        responseTime: akamaiService?.responseTime,
-        timestamp: akamaiService?.timestamp,
-      },
-      cloudflare: {
-        status: cloudflareStatus,
-        active: cloudflareService?.isActive || false,
-        responseTime: cloudflareService?.responseTime,
-        timestamp: cloudflareService?.timestamp,
-      },
-    }
-  })
-
-  return {
-    dnsProtection,
-    serviceProviders,
-    dnsRecords,
-    cdnServices,
-    cleanPipeStatuses,
-  }
-}
-
-export function useMonitoringData() {
-  // State for all data sections
-  const [dnsProtection, setDnsProtection] = useState<DDoSProtection[]>([])
-  const [serviceProviders, setServiceProviders] = useState<ServiceProvider[]>([])
-  const [dnsRecords, setDnsRecords] = useState<DDoSProtection[]>([])
-  const [cdnServices, setCdnServices] = useState<CDNService[]>([])
-  const [cleanPipeStatuses, setCleanPipeStatuses] = useState<{
-    akamai: Record<string, any>
-    cloudflare: Record<string, any>
-  }>({
-    akamai: {},
-    cloudflare: {},
-  })
-
-  // Common state
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<Error | null>(null)
-  const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
-  const [rawData, setRawData] = useState<any>(null)
-
-  // Get the selected time point from the history store
-  const { selectedTimePoint, setRawTimestamps } = useHistoryStore()
-
-  // Function to fetch and parse all data
-  const fetchData = useCallback(async () => {
-    try {
-      setLoading(true)
-      console.log(`[${new Date().toISOString()}] Fetching monitoring data...`)
-
-      // Fetch the monitoring data
-      const data = await fetchMonitoringData()
-      setRawData(data)
-
-      // Extract all timestamps from the data
-      const timestamps = extractTimestamps(data)
-
-      // This will trigger generateTimelineFromTimestamps() which handles auto-selection
-      setRawTimestamps(timestamps)
-
-      console.log(`[${new Date().toISOString()}] Data fetched and parsed successfully`)
-    } catch (err) {
-      console.error("Failed to fetch monitoring data:", err)
-      setError(err instanceof Error ? err : new Error(String(err)))
-    } finally {
-      setLoading(false)
-    }
-  }, [setRawTimestamps])
-
-  // Effect to update displayed data when selected time point changes
-  useEffect(() => {
-    if (!selectedTimePoint || !rawData) return
-
-    try {
-      console.log("Updating displayed data for timestamp:", selectedTimePoint.label)
-
-      // Get the target timestamp
-      const targetTimestamp = selectedTimePoint.timestamp
-
-      // Parse all data for the selected timestamp
-      const parsedData = parseAllData(rawData, targetTimestamp)
-
-      // Set the last updated timestamp
-      let updatedTimestamp: Date
-      if (selectedTimePoint.isLatest) {
-        // If viewing latest data, use current time or the timestamp from data
-        const timestamps = extractTimestamps(rawData)
-        updatedTimestamp = timestamps.length > 0 ? timestamps[timestamps.length - 1] : new Date()
-      } else {
-        // If viewing historical data, use the target timestamp
-        updatedTimestamp = targetTimestamp
+    if (rawTimestamps.length === 0) {
+      // If no timestamps, create a default point with current time
+      const now = new Date()
+      const defaultPoint = {
+        timestamp: now,
+        label: format(now, "h:mm a"),
+        isLatest: true,
       }
 
-      // Update state with parsed data
-      setDnsProtection(parsedData.dnsProtection)
-      setServiceProviders(parsedData.serviceProviders)
-      setDnsRecords(parsedData.dnsRecords)
-      setCdnServices(parsedData.cdnServices)
-      setCleanPipeStatuses(parsedData.cleanPipeStatuses)
-      setLastUpdated(updatedTimestamp)
-      setError(null)
-    } catch (err) {
-      console.error("Error parsing data for selected timestamp:", err)
+      set({
+        timelinePoints: [defaultPoint],
+        selectedTimePoint: defaultPoint,
+        hasManualSelection: false,
+      })
+      return
     }
-  }, [selectedTimePoint, rawData])
 
-  // Set up polling
-  useEffect(() => {
-    const cleanup = setupPolling(fetchData)
-    return cleanup
-  }, [fetchData])
+    // Sort timestamps in ascending order (oldest first)
+    const sortedTimestamps = [...rawTimestamps].sort((a, b) => a.getTime() - b.getTime())
 
-  // Function to manually refresh data
-  const refreshData = useCallback(() => {
-    return fetchData()
-  }, [fetchData])
+    // Create timeline points from all timestamps
+    const timelinePoints: TimelineDataPoint[] = sortedTimestamps.map((timestamp, index) => {
+      const isLatest = index === sortedTimestamps.length - 1
+      return {
+        timestamp,
+        label: format(timestamp, "h:mm a"),
+        isLatest,
+      }
+    })
 
-  return {
-    dnsProtection,
-    serviceProviders,
-    dnsRecords,
-    cdnServices,
-    cleanPipeStatuses,
-    loading,
-    error,
-    lastUpdated,
-    refreshData,
-  }
-}
+    set({ timelinePoints })
+
+    // Auto-select latest point only on initial load (when no point is selected)
+    if (!selectedTimePoint) {
+      const latestPoint = timelinePoints[timelinePoints.length - 1]
+      console.log("Initial load - auto-selecting latest point:", latestPoint?.label)
+      set({
+        selectedTimePoint: latestPoint,
+        hasManualSelection: false,
+      })
+    }
+  },
+
+  autoSelectLatestOnPolling: () => {
+    const { timelinePoints } = get()
+
+    // Always auto-select latest point on polling refresh, regardless of manual selection
+    if (timelinePoints.length > 0) {
+      const latestPoint = timelinePoints[timelinePoints.length - 1]
+      console.log("Polling refresh - auto-selecting latest point:", latestPoint?.label, "(ignoring manual selection)")
+      set({
+        selectedTimePoint: latestPoint,
+        // Reset hasManualSelection since we're forcing auto-selection
+        hasManualSelection: false,
+      })
+    }
+  },
+
+  setSelectedTimePoint: (point, isManual = false) => {
+    console.log("Setting selected point:", point?.label, "isManual:", isManual)
+    set({
+      selectedTimePoint: point,
+      // Set hasManualSelection to true if this is a manual selection
+      hasManualSelection: isManual || get().hasManualSelection,
+    })
+  },
+}))
